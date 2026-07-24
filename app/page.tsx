@@ -117,14 +117,14 @@ export default function Home() {
     osc2.connect(gain);
     osc1.start();
     osc2.start();
-    // 1초 울림 / 2초 침묵 반복 (통화 연결음 근사)
-    let slot = 0;
+    // 0.5초 간격 울림/침묵 반복 (짧은 대기에도 끊김 없이 자연스러운 연결음)
+    let on = false;
     const ring = () => {
-      gain.gain.setTargetAtTime(slot === 0 ? 0.06 : 0, ctx.currentTime, 0.02);
-      slot = (slot + 1) % 3;
+      on = !on;
+      gain.gain.setTargetAtTime(on ? 0.06 : 0, ctx.currentTime, 0.02);
     };
     ring();
-    const timer = window.setInterval(ring, 1000);
+    const timer = window.setInterval(ring, 500);
     ringbackRef.current = {
       stop: () => {
         clearInterval(timer);
@@ -443,7 +443,16 @@ export default function Home() {
             </div>
           </div>
 
-          {/* 대화 로그 */}
+          {/* 통화음(연결 중)에는 연결 화면, 음성이 시작되면 대화 로그 */}
+          {status === "connecting" ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-4 px-4">
+              <div className="flex h-20 w-20 animate-pulse items-center justify-center rounded-full bg-emerald-600/20">
+                <span className="text-4xl">📞</span>
+              </div>
+              <p className="text-base font-medium text-neutral-200">연결 중…</p>
+              <p className="text-xs text-neutral-500">잠시만 기다려 주세요</p>
+            </div>
+          ) : (
           <div ref={logRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-neutral-500">
@@ -468,6 +477,7 @@ export default function Home() {
               </div>
             ))}
           </div>
+          )}
 
           {/* 통화 컨트롤 */}
           <div className="border-t border-neutral-800 px-5 py-5">
