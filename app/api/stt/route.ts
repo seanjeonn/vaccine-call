@@ -32,8 +32,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ text: transcription.text });
   } catch (err) {
     console.error("[stt] error", err);
+    const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { error: "음성 인식에 실패했습니다." },
+      { error: `음성 인식 실패: ${detail}` },
       { status: 500 },
     );
   }

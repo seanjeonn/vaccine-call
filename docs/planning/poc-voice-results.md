@@ -13,7 +13,7 @@
 | --- | --- | --- |
 | 프레임워크/호스팅 | Next.js 16 (App Router) + Vercel | 루트 앱 |
 | STT | OpenAI `gpt-4o-mini-transcribe` (`language: ko`) | `app/api/stt/route.ts` |
-| LLM | `claude-sonnet-4-6` (스트리밍, max_tokens 400) | `app/api/chat/route.ts` |
+| LLM | OpenAI `gpt-4o` (max_tokens 400) | `app/api/chat/route.ts` |
 | TTS | OpenAI `gpt-4o-mini-tts` (voice `onyx`, 사기꾼 톤 instructions) | `app/api/tts/route.ts` |
 | 녹음 | MediaRecorder (`audio/webm`) | `app/page.tsx` |
 
@@ -57,7 +57,7 @@
 - [ ] 성공 기준 충족 → 기능명세서에 스택 확정, W2 진입
 - [ ] STT 미달 → `gpt-4o-transcribe` 승격 / Clova·ReturnZero 대안
 - [ ] TTS 미달 → ElevenLabs / Clova Voice 대안
-- [ ] 지연 미달 → `claude-haiku-4-5` + 문장 단위 TTS 파이프라이닝
+- [ ] 지연 미달 → LLM `gpt-4o-mini`로 교체 + 문장 단위 TTS 파이프라이닝
 
 **결론:**
 _(F1을 음성으로 갈지, 다운스코프할지 여기에 확정 기록 — W1의 필수 산출물)_

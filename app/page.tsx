@@ -37,31 +37,28 @@ export default function Home() {
         const fd = new FormData();
         fd.append("audio", audioBlob, "speech.webm");
         const sttRes = await fetch("/api/stt", { method: "POST", body: fd });
-        if (!sttRes.ok) throw new Error("STT 실패");
+        if (!sttRes.ok) {
+          const body = await sttRes.json().catch(() => null);
+          throw new Error(body?.error ?? `STT 실패 (${sttRes.status})`);
+        }
         const { text: userText } = (await sttRes.json()) as { text: string };
         const tStt = performance.now();
 
         const withUser: Message[] = [...history, { role: "user", content: userText }];
         setMessages(withUser);
 
-        // 2) LLM (스트리밍)
+        // 2) LLM
         const chatRes = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ messages: withUser }),
         });
-        if (!chatRes.ok || !chatRes.body) throw new Error("LLM 실패");
-
-        const reader = chatRes.body.getReader();
-        const decoder = new TextDecoder();
-        let assistantText = "";
-        setMessages([...withUser, { role: "assistant", content: "" }]);
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          assistantText += decoder.decode(value, { stream: true });
-          setMessages([...withUser, { role: "assistant", content: assistantText }]);
+        if (!chatRes.ok) {
+          const body = await chatRes.json().catch(() => null);
+          throw new Error(body?.error ?? `LLM 실패 (${chatRes.status})`);
         }
+        const { text: assistantText } = (await chatRes.json()) as { text: string };
+        setMessages([...withUser, { role: "assistant", content: assistantText }]);
         const tLlm = performance.now();
 
         // 3) TTS → 재생
@@ -70,7 +67,10 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: assistantText }),
         });
-        if (!ttsRes.ok) throw new Error("TTS 실패");
+        if (!ttsRes.ok) {
+          const body = await ttsRes.json().catch(() => null);
+          throw new Error(body?.error ?? `TTS 실패 (${ttsRes.status})`);
+        }
         const audioData = await ttsRes.blob();
         const url = URL.createObjectURL(audioData);
         const tTts = performance.now();

@@ -1,10 +1,10 @@
-import { NextRequest } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
+import { NextRequest, NextResponse } from "next/server";
+import OpenAI from "openai";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const MODEL = "claude-sonnet-4-6";
+const MODEL = "gpt-4o";
 
 // 사기 예방 훈련용 "기관사칭형 사기꾼" 롤플레이 시스템 프롬프트.
 // 실제 피해가 아니라 훈련이므로, 사용자를 속이려 시도하되 계좌·비밀번호 등
@@ -22,51 +22,37 @@ const SYSTEM_PROMPT = `당신은 금융사기 예방 훈련 시뮬레이션에�
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
-// 대화 이력을 받아 사기꾼 롤플레이 응답을 스트리밍(text/plain)으로 반환한다.
+// 대화 이력을 받아 사기꾼 롤플레이 응답 텍스트를 반환한다.
 export async function POST(req: NextRequest) {
   try {
-    const anthropic = new Anthropic();
+    const openai = new OpenAI();
     const { messages } = (await req.json()) as { messages: ChatMessage[] };
 
     if (!Array.isArray(messages) || messages.length === 0) {
-      return new Response("messages 배열이 필요합니다.", { status: 400 });
+      return NextResponse.json(
+        { error: "messages 배열이 필요합니다." },
+        { status: 400 },
+      );
     }
 
-    const stream = anthropic.messages.stream({
+    const completion = await openai.chat.completions.create({
       model: MODEL,
       max_tokens: 400,
-      system: SYSTEM_PROMPT,
-      messages: messages.map((m) => ({ role: m.role, content: m.content })),
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...messages.map((m) => ({ role: m.role, content: m.content })),
+      ],
     });
 
-    const encoder = new TextEncoder();
-    const body = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        try {
-          for await (const event of stream) {
-            if (
-              event.type === "content_block_delta" &&
-              event.delta.type === "text_delta"
-            ) {
-              controller.enqueue(encoder.encode(event.delta.text));
-            }
-          }
-          controller.close();
-        } catch (err) {
-          console.error("[chat] stream error", err);
-          controller.error(err);
-        }
-      },
-    });
+    const text = completion.choices[0]?.message?.content ?? "";
 
-    return new Response(body, {
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Cache-Control": "no-store",
-      },
-    });
+    return NextResponse.json({ text });
   } catch (err) {
     console.error("[chat] error", err);
-    return new Response("응답 생성에 실패했습니다.", { status: 500 });
+    const detail = err instanceof Error ? err.message : String(err);
+    return NextResponse.json(
+      { error: `응답 생성 실패: ${detail}` },
+      { status: 500 },
+    );
   }
 }

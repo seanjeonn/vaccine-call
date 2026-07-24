@@ -39,8 +39,9 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     console.error("[tts] error", err);
+    const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { error: "음성 합성에 실패했습니다." },
+      { error: `음성 합성 실패: ${detail}` },
       { status: 500 },
     );
   }
