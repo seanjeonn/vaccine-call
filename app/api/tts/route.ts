@@ -1,18 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
+import { getScenario } from "@/lib/scenarios";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-// 사기꾼 톤 지시. PoC에서 톤 반영 정도를 함께 검증한다.
-const TONE_INSTRUCTIONS =
-  "낮고 위압적인 40대 남성 검사·수사관 목소리로, 단호하고 사무적이며 상대를 압박하듯 말하세요.";
-
-// 텍스트를 받아 한국어 TTS 음성(mp3 바이너리)을 반환한다.
+// 텍스트와 시나리오를 받아 배역에 맞는 한국어 TTS 음성(mp3 바이너리)을 반환한다.
 export async function POST(req: NextRequest) {
   try {
     const openai = new OpenAI();
-    const { text } = (await req.json()) as { text: string };
+    const { text, scenario } = (await req.json()) as {
+      text: string;
+      scenario?: string;
+    };
 
     if (!text || typeof text !== "string") {
       return NextResponse.json(
@@ -21,11 +21,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const { voice, ttsInstructions } = getScenario(scenario);
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
-      voice: "onyx",
+      voice,
       input: text,
-      instructions: TONE_INSTRUCTIONS,
+      instructions: ttsInstructions,
       response_format: "mp3",
     });
 
