@@ -412,7 +412,7 @@ export default function Home() {
   return (
     <main className="flex min-h-screen flex-col items-center gap-6 bg-neutral-900 px-4 py-8 text-neutral-100">
       <header className="text-center">
-        <h1 className="text-lg font-semibold">보이스백신 · 음성 대화 PoC</h1>
+        <h1 className="text-lg font-semibold">백신콜 · 음성 대화 PoC</h1>
         <p className="text-xs text-neutral-400">
           연속 통화형 STT → LLM → TTS 음성 대화 (데스크톱 데모)
         </p>

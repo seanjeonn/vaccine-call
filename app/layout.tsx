@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "보이스백신 · 음성 대화 PoC",
+  title: "백신콜 · 음성 대화 PoC",
   description: "STT → LLM → TTS 턴제 음성 대화 기술 검증 데모",
 };
 
