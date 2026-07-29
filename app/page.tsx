@@ -20,6 +20,27 @@ type ReportPhase = "none" | "loading" | "ready" | "error";
 
 const round = (ms: number) => Math.round(ms);
 
+// 스트리밍 버퍼에서 완성된 문장만 잘라낸다. 완성분은 곧바로 TTS로 넘기고 나머지는 다음 청크와 이어 붙인다.
+function takeSentences(buffer: string): { sentences: string[]; rest: string } {
+  const sentences: string[] = [];
+  let start = 0;
+  for (let i = 0; i < buffer.length; i++) {
+    if (!".?!…".includes(buffer[i])) continue;
+    // 3.5처럼 숫자 사이의 마침표는 문장 끝이 아니다.
+    if (
+      buffer[i] === "." &&
+      /\d/.test(buffer[i - 1] ?? "") &&
+      /\d/.test(buffer[i + 1] ?? "")
+    ) {
+      continue;
+    }
+    const piece = buffer.slice(start, i + 1).trim();
+    if (piece) sentences.push(piece);
+    start = i + 1;
+  }
+  return { sentences, rest: buffer.slice(start) };
+}
+
 // --- VAD 튜닝 상수 (데스크톱 Chrome 기준 시작값) ---
 const VAD_INTERVAL_MS = 50; // RMS 샘플링 주기
 const VAD_RMS_THRESHOLD = 0.02; // 발화 판정 임계값 (환경 따라 0.01~0.05)
@@ -203,56 +224,74 @@ export default function Home() {
     };
   }, []);
 
-  // 준비된 대사 텍스트를 TTS로 합성·재생하고, 재생이 끝나면 다음 청취를 시작한다.
-  // t0: 턴 시작 시각, sttMs: STT 소요(없으면 null), tLlm: LLM 완료 시각(오프닝은 t0).
-  const playAssistantAudio = useCallback(
-    async (text: string, t0: number, sttMs: number | null, tLlm: number) => {
-      const ttsRes = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, scenario: scenarioRef.current?.id }),
-      });
-      if (!ttsRes.ok) {
-        const body = await ttsRes.json().catch(() => null);
-        throw new Error(body?.error ?? `TTS 실패 (${ttsRes.status})`);
-      }
-      const audioData = await ttsRes.blob();
-      if (!callActiveRef.current) return;
-      const url = URL.createObjectURL(audioData);
-      const tTts = performance.now();
+  // 문장 하나를 TTS로 합성해 오디오 Blob을 받는다.
+  const synthesize = useCallback(async (text: string) => {
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, scenario: scenarioRef.current?.id }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error(body?.error ?? `TTS 실패 (${res.status})`);
+    }
+    return res.blob();
+  }, []);
 
-      const llmStart = t0 + (sttMs ?? 0);
-      setLatencies((prev) => [
-        ...prev,
-        {
-          turn: prev.length + 1,
-          stt: sttMs,
-          llm: tLlm - llmStart,
-          tts: tTts - tLlm,
-          total: tTts - t0,
-        },
-      ]);
-
-      ringbackRef.current?.stop(); // 연결음 정지 후 대사 재생
+  // 오디오 한 조각을 재생하고 끝날 때까지 기다린다. onStart는 소리가 실제로 나오는 순간
+  // 호출되며, 자막을 그 시점에 맞추는 데 쓴다.
+  const playBlob = useCallback((blob: Blob, onStart: () => void) => {
+    return new Promise<void>((resolve) => {
       const audioEl = audioRef.current;
+      const url = URL.createObjectURL(blob);
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        URL.revokeObjectURL(url);
+        resolve();
+      };
       if (!audioEl) {
-        if (callActiveRef.current) startListeningRef.current();
+        onStart();
+        finish();
         return;
       }
       audioEl.src = url;
-      setStatus("speaking");
-      audioEl.onended = () => {
-        URL.revokeObjectURL(url);
-        if (callActiveRef.current) startListeningRef.current();
+      audioEl.onplay = () => {
+        onStart();
+        // 재생이 시작된 뒤에만 pause를 종료 신호로 본다. (통화 종료로 멈춘 경우 대기 해제)
+        audioEl.onpause = finish;
       };
-      await audioEl.play().catch(() => {
-        if (callActiveRef.current) startListeningRef.current();
+      audioEl.onended = finish;
+      audioEl.play().catch(() => {
+        // 재생이 막히면 onplay가 오지 않는다. 최소한 대사는 읽을 수 있게 띄운다.
+        onStart();
+        finish();
       });
+    });
+  }, []);
+
+  // 준비된 대사 한 줄을 합성·재생한다. (오프닝처럼 LLM을 거치지 않는 고정 대사용)
+  const speakLine = useCallback(
+    async (text: string, nextConversation: Message[], t0: number) => {
+      const blob = await synthesize(text);
+      if (!callActiveRef.current) return;
+      const tAudio = performance.now();
+      setLatencies((prev) => [
+        ...prev,
+        { turn: prev.length + 1, stt: null, llm: 0, tts: tAudio - t0, total: tAudio - t0 },
+      ]);
+      ringbackRef.current?.stop(); // 연결음 정지 후 대사 재생
+      setStatus("speaking");
+      await playBlob(blob, () => setConversation(nextConversation));
+      if (callActiveRef.current) startListeningRef.current();
     },
-    [],
+    [synthesize, playBlob, setConversation],
   );
 
-  // LLM으로 응답을 생성한 뒤 재생한다. t0: 턴 시작, sttMs: STT 소요.
+  // LLM 응답을 스트리밍으로 받아, 문장이 완성될 때마다 TTS를 먼저 태우고 순서대로 재생한다.
+  // 전체 응답을 기다렸다가 한 번에 합성하면 첫 소리까지 LLM 전체 + TTS 전체 시간이 걸린다.
+  // t0: 턴 시작, sttMs: STT 소요.
   const assistantRespond = useCallback(
     async (history: Message[], t0: number, sttMs: number | null) => {
       const chatRes = await fetch("/api/chat", {
@@ -260,17 +299,85 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages: history, scenario: scenarioRef.current?.id }),
       });
-      if (!chatRes.ok) {
+      if (!chatRes.ok || !chatRes.body) {
         const body = await chatRes.json().catch(() => null);
         throw new Error(body?.error ?? `LLM 실패 (${chatRes.status})`);
       }
-      const { text: assistantText } = (await chatRes.json()) as { text: string };
-      if (!callActiveRef.current) return;
-      setConversation([...history, { role: "assistant", content: assistantText }]);
-      const tLlm = performance.now();
-      await playAssistantAudio(assistantText, t0, sttMs, tLlm);
+
+      type Segment = { text: string; audio: Promise<Blob> };
+      const segments: Segment[] = [];
+      let streamDone = false;
+      let firstSentenceAt: number | null = null;
+      // 새 문장이 준비되면 재생 루프를 깨우는 신호.
+      const waiter: { wake: (() => void) | null } = { wake: null };
+      const pushSegment = (text: string) => {
+        if (firstSentenceAt === null) firstSentenceAt = performance.now();
+        segments.push({ text, audio: synthesize(text) });
+        waiter.wake?.();
+      };
+
+      const pump = (async () => {
+        const reader = chatRes.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!callActiveRef.current) return;
+            buffer += decoder.decode(value, { stream: true });
+            const { sentences, rest } = takeSentences(buffer);
+            buffer = rest;
+            sentences.forEach(pushSegment);
+          }
+          const tail = buffer.trim();
+          if (tail) pushSegment(tail); // 마침표 없이 끝난 마지막 조각
+        } finally {
+          streamDone = true;
+          waiter.wake?.();
+        }
+      })();
+
+      // 준비된 조각부터 순서대로 재생한다. 뒤 문장은 앞 문장이 나가는 동안 합성된다.
+      let spoken = "";
+      let played = 0;
+      let audioStarted = false;
+      while (played < segments.length || !streamDone) {
+        if (played >= segments.length) {
+          await new Promise<void>((resolve) => {
+            waiter.wake = resolve;
+          });
+          waiter.wake = null;
+          continue;
+        }
+        const segment = segments[played++];
+        const blob = await segment.audio;
+        if (!callActiveRef.current) return;
+        if (!audioStarted) {
+          audioStarted = true;
+          const tAudio = performance.now();
+          const llmStart = t0 + (sttMs ?? 0);
+          setLatencies((prev) => [
+            ...prev,
+            {
+              turn: prev.length + 1,
+              stt: sttMs,
+              llm: (firstSentenceAt ?? tAudio) - llmStart,
+              tts: tAudio - (firstSentenceAt ?? tAudio),
+              total: tAudio - t0,
+            },
+          ]);
+          setStatus("speaking");
+        }
+        spoken = spoken ? `${spoken} ${segment.text}` : segment.text;
+        const caption: Message[] = [...history, { role: "assistant", content: spoken }];
+        await playBlob(blob, () => setConversation(caption));
+      }
+
+      await pump; // 스트림 오류를 여기서 드러낸다
+      if (callActiveRef.current) startListeningRef.current();
     },
-    [setConversation, playAssistantAudio],
+    [synthesize, playBlob, setConversation],
   );
 
   // 사용자 발화 오디오 한 턴 처리: STT → (내용 있으면) assistantRespond.
@@ -431,8 +538,11 @@ export default function Home() {
 
       // 오프닝: 사기꾼이 먼저 말한다. 고정 대사라 LLM 없이 TTS만 태운다.
       const t0 = performance.now();
-      setConversation([{ role: "assistant", content: picked.opening }]);
-      await playAssistantAudio(picked.opening, t0, null, t0);
+      await speakLine(
+        picked.opening,
+        [{ role: "assistant", content: picked.opening }],
+        t0,
+      );
     } catch (err) {
       if (err instanceof DOMException) {
         failCall("마이크 권한이 필요합니다.");
@@ -440,7 +550,7 @@ export default function Home() {
         failCall(err instanceof Error ? err.message : "통화를 시작할 수 없습니다.");
       }
     }
-  }, [startRingback, playAssistantAudio, failCall, setConversation, clearReport]);
+  }, [startRingback, speakLine, failCall, setConversation, clearReport]);
 
   const reset = useCallback(() => {
     teardown();
@@ -661,7 +771,8 @@ export default function Home() {
           </tbody>
         </table>
         <p className="mt-2 text-[11px] text-neutral-500">
-          합계 = 턴 시작 → TTS 재생 준비 완료까지. 목표 ≤ 4000ms, 허용 ≤ 7000ms. (오프닝 턴은 STT 없음)
+          합계 = 턴 시작 → <b>첫 음성이 나오기까지</b>. LLM은 첫 문장이 완성되기까지, TTS는 그 문장의
+          합성 시간. 목표 ≤ 4000ms, 허용 ≤ 7000ms. (오프닝 턴은 STT 없음)
         </p>
       </div>
     </main>
