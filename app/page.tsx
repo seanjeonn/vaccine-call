@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SCENARIOS, type Scenario } from "@/lib/scenarios";
+import type { TrainingReport } from "@/lib/report";
+import TrainingReportView from "@/components/training-report";
 
 type Role = "user" | "assistant";
 type Message = { role: Role; content: string };
@@ -13,6 +15,8 @@ type Latency = {
   total: number;
 };
 type Status = "idle" | "connecting" | "speaking" | "listening" | "processing";
+// 리포트는 통화 상태와 별개로 흐른다. (통화 종료 후 idle 상태에서만 표시)
+type ReportPhase = "none" | "loading" | "ready" | "error";
 
 const round = (ms: number) => Math.round(ms);
 
@@ -30,6 +34,11 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [scenario, setScenario] = useState<Scenario | null>(null);
   const scenarioRef = useRef<Scenario | null>(null);
+
+  const [reportPhase, setReportPhase] = useState<ReportPhase>("none");
+  const [report, setReport] = useState<TrainingReport | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const reportAbortRef = useRef<AbortController | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -55,6 +64,55 @@ export default function Home() {
     messagesRef.current = next;
     setMessages(next);
   }, []);
+
+  // 진행 중인 리포트 요청을 취소하고 리포트 화면을 걷어낸다. (새 통화·초기화 공통)
+  const clearReport = useCallback(() => {
+    reportAbortRef.current?.abort();
+    reportAbortRef.current = null;
+    setReportPhase("none");
+    setReport(null);
+    setReportError(null);
+  }, []);
+
+  // 통화 종료 후 대화 기록을 분석해 훈련 리포트를 만든다.
+  const generateReport = useCallback(
+    async (transcript: Message[], scenarioId: string | undefined) => {
+      // 사용자가 한마디도 하지 않은 통화는 분석할 것이 없다. (LLM 호출 생략)
+      if (!transcript.some((m) => m.role === "user")) {
+        setReport(null);
+        setReportError(null);
+        setReportPhase("ready");
+        return;
+      }
+
+      const controller = new AbortController();
+      reportAbortRef.current = controller;
+      setReport(null);
+      setReportError(null);
+      setReportPhase("loading");
+
+      try {
+        const res = await fetch("/api/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: transcript, scenario: scenarioId }),
+          signal: controller.signal,
+        });
+        const data = await res.json();
+        if (controller.signal.aborted) return;
+        if (!res.ok) throw new Error(data.error ?? "리포트를 만들지 못했습니다.");
+        setReport(data.report as TrainingReport);
+        setReportPhase("ready");
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setReportError(err instanceof Error ? err.message : "리포트를 만들지 못했습니다.");
+        setReportPhase("error");
+      } finally {
+        if (reportAbortRef.current === controller) reportAbortRef.current = null;
+      }
+    },
+    [],
+  );
 
   // 통화 관련 리소스를 모두 해제한다. (통화 종료·오류 공통)
   const teardown = useCallback(() => {
@@ -85,20 +143,24 @@ export default function Home() {
     analyserRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
-    scenarioRef.current = null;
-    setScenario(null);
+    // 시나리오는 남겨둔다. 통화 종료 후 리포트 화면이 어떤 훈련이었는지 표시해야 한다.
   }, []);
 
   const endCall = useCallback(() => {
+    const transcript = messagesRef.current;
+    const scenarioId = scenarioRef.current?.id;
     teardown();
     setStatus("idle");
-  }, [teardown]);
+    void generateReport(transcript, scenarioId);
+  }, [teardown, generateReport]);
 
   const failCall = useCallback(
     (message: string) => {
       console.error(message);
       setError(message);
       teardown();
+      scenarioRef.current = null;
+      setScenario(null);
       setStatus("idle");
     },
     [teardown],
@@ -335,6 +397,7 @@ export default function Home() {
   // 통화 시작: 시나리오 랜덤 배정 → 마이크 확보 → 오디오 분석 셋업 → 오프닝 대사 재생.
   const startCall = useCallback(async () => {
     setError(null);
+    clearReport();
     setConversation([]);
     setLatencies([]);
     const picked = SCENARIOS[Math.floor(Math.random() * SCENARIOS.length)];
@@ -377,15 +440,18 @@ export default function Home() {
         failCall(err instanceof Error ? err.message : "통화를 시작할 수 없습니다.");
       }
     }
-  }, [startRingback, playAssistantAudio, failCall, setConversation]);
+  }, [startRingback, playAssistantAudio, failCall, setConversation, clearReport]);
 
   const reset = useCallback(() => {
     teardown();
+    clearReport();
+    scenarioRef.current = null;
+    setScenario(null);
     setConversation([]);
     setLatencies([]);
     setError(null);
     setStatus("idle");
-  }, [teardown, setConversation]);
+  }, [teardown, setConversation, clearReport]);
 
   // 언마운트 시 리소스 정리
   useEffect(() => {
@@ -398,8 +464,13 @@ export default function Home() {
   }, []);
 
   const inCall = status !== "idle";
-  const statusLine =
-    status === "connecting"
+  // 통화가 끝나고 리포트 흐름이 살아 있는 동안은 "다시 훈련하기"로 전환한다.
+  const showingReport = !inCall && reportPhase !== "none";
+  const statusLine = showingReport
+    ? reportPhase === "loading"
+      ? "통화 종료 · 분석 중"
+      : "훈련이 끝났어요"
+    : status === "connecting"
       ? "연결 중…"
       : status === "speaking"
         ? "상대방이 말하는 중…"
@@ -443,7 +514,7 @@ export default function Home() {
             </div>
           </div>
 
-          {/* 통화음(연결 중)에는 연결 화면, 음성이 시작되면 대화 로그 */}
+          {/* 통화음(연결 중)에는 연결 화면, 통화가 끝나면 리포트, 그 외에는 대화 로그 */}
           {status === "connecting" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-4 px-4">
               <div className="flex h-20 w-20 animate-pulse items-center justify-center rounded-full bg-emerald-600/20">
@@ -452,8 +523,50 @@ export default function Home() {
               <p className="text-base font-medium text-neutral-200">연결 중…</p>
               <p className="text-xs text-neutral-500">잠시만 기다려 주세요</p>
             </div>
+          ) : reportPhase === "loading" ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-4 px-4">
+              <div className="flex h-20 w-20 animate-pulse items-center justify-center rounded-full bg-blue-600/20">
+                <span className="text-4xl">📋</span>
+              </div>
+              <p className="text-base font-medium text-neutral-200">분석 중…</p>
+              <p className="text-xs text-neutral-500">
+                AI가 통화 내용을 살펴보고 있어요
+              </p>
+            </div>
+          ) : reportPhase === "ready" && report ? (
+            <TrainingReportView
+              report={report}
+              messages={messages}
+              scenarioLabel={scenario?.label}
+            />
+          ) : reportPhase === "ready" ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+              <span className="text-4xl">🙂</span>
+              <p className="text-base font-medium text-neutral-200">
+                대화가 너무 짧아 분석할 수 없어요
+              </p>
+              <p className="text-xs text-neutral-500">
+                다음 훈련에서는 사기꾼과 조금 더 이야기해 보세요.
+              </p>
+            </div>
           ) : (
           <div ref={logRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
+            {reportPhase === "error" && (
+              <div className="rounded-lg bg-red-500/15 px-3 py-2 text-[13px] text-red-300">
+                <p>리포트를 만들지 못했어요.</p>
+                {reportError && (
+                  <p className="mt-1 text-[11px] text-red-400/80">{reportError}</p>
+                )}
+                <button
+                  onClick={() =>
+                    void generateReport(messages, scenarioRef.current?.id)
+                  }
+                  className="mt-2 rounded-md bg-red-500/20 px-2.5 py-1 text-[12px] font-medium text-red-200 hover:bg-red-500/30"
+                >
+                  다시 시도
+                </button>
+              </div>
+            )}
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-neutral-500">
                 아래 &ldquo;통화 시작&rdquo; 버튼을 눌러 모의 통화를 시작하세요.
@@ -483,7 +596,9 @@ export default function Home() {
           <div className="border-t border-neutral-800 px-5 py-5">
             <p className="mb-2 text-center text-xs text-neutral-400">{statusLine}</p>
             <button
-              onClick={inCall ? endCall : () => void startCall()}
+              onClick={
+                inCall ? endCall : showingReport ? reset : () => void startCall()
+              }
               className={
                 "flex w-full items-center justify-center gap-2 rounded-full py-4 text-base font-semibold transition " +
                 (inCall
@@ -491,7 +606,7 @@ export default function Home() {
                   : "bg-emerald-600 text-white hover:bg-emerald-500")
               }
             >
-              {inCall ? "통화 종료" : "통화 시작"}
+              {inCall ? "통화 종료" : showingReport ? "다시 훈련하기" : "통화 시작"}
             </button>
           </div>
         </div>
