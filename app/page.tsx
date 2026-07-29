@@ -204,9 +204,17 @@ export default function Home() {
   }, []);
 
   // 준비된 대사 텍스트를 TTS로 합성·재생하고, 재생이 끝나면 다음 청취를 시작한다.
+  // 대사 말풍선(nextConversation)은 음성이 실제로 나오는 순간에 띄운다. 합성을 기다리는
+  // 동안 자막이 먼저 뜨면 목소리보다 몇 초 앞서 보이기 때문.
   // t0: 턴 시작 시각, sttMs: STT 소요(없으면 null), tLlm: LLM 완료 시각(오프닝은 t0).
   const playAssistantAudio = useCallback(
-    async (text: string, t0: number, sttMs: number | null, tLlm: number) => {
+    async (
+      text: string,
+      nextConversation: Message[],
+      t0: number,
+      sttMs: number | null,
+      tLlm: number,
+    ) => {
       const ttsRes = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -236,20 +244,24 @@ export default function Home() {
       ringbackRef.current?.stop(); // 연결음 정지 후 대사 재생
       const audioEl = audioRef.current;
       if (!audioEl) {
+        setConversation(nextConversation);
         if (callActiveRef.current) startListeningRef.current();
         return;
       }
       audioEl.src = url;
       setStatus("speaking");
+      audioEl.onplay = () => setConversation(nextConversation);
       audioEl.onended = () => {
         URL.revokeObjectURL(url);
         if (callActiveRef.current) startListeningRef.current();
       };
       await audioEl.play().catch(() => {
+        // 재생이 막히면 onplay가 오지 않는다. 최소한 대사는 읽을 수 있게 띄운다.
+        setConversation(nextConversation);
         if (callActiveRef.current) startListeningRef.current();
       });
     },
-    [],
+    [setConversation],
   );
 
   // LLM으로 응답을 생성한 뒤 재생한다. t0: 턴 시작, sttMs: STT 소요.
@@ -266,11 +278,16 @@ export default function Home() {
       }
       const { text: assistantText } = (await chatRes.json()) as { text: string };
       if (!callActiveRef.current) return;
-      setConversation([...history, { role: "assistant", content: assistantText }]);
       const tLlm = performance.now();
-      await playAssistantAudio(assistantText, t0, sttMs, tLlm);
+      await playAssistantAudio(
+        assistantText,
+        [...history, { role: "assistant", content: assistantText }],
+        t0,
+        sttMs,
+        tLlm,
+      );
     },
-    [setConversation, playAssistantAudio],
+    [playAssistantAudio],
   );
 
   // 사용자 발화 오디오 한 턴 처리: STT → (내용 있으면) assistantRespond.
@@ -431,8 +448,13 @@ export default function Home() {
 
       // 오프닝: 사기꾼이 먼저 말한다. 고정 대사라 LLM 없이 TTS만 태운다.
       const t0 = performance.now();
-      setConversation([{ role: "assistant", content: picked.opening }]);
-      await playAssistantAudio(picked.opening, t0, null, t0);
+      await playAssistantAudio(
+        picked.opening,
+        [{ role: "assistant", content: picked.opening }],
+        t0,
+        null,
+        t0,
+      );
     } catch (err) {
       if (err instanceof DOMException) {
         failCall("마이크 권한이 필요합니다.");
