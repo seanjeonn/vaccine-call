@@ -40,6 +40,28 @@ export default async function LandingPage() {
         </Link>
       </section>
 
+      <section className="rounded-xl border border-emerald-800/60 bg-emerald-500/5 p-4">
+        <h2 className="text-sm font-semibold text-emerald-300">심사위원 체험</h2>
+        <p className="mt-1 text-sm leading-relaxed text-neutral-400">
+          가입 없이 두 화면을 바로 둘러볼 수 있습니다. 부모 화면에서 훈련을 마치면 자녀
+          화면에 결과가 쌓입니다.
+        </p>
+        <div className="mt-3 flex gap-2">
+          <a
+            href="/api/demo?role=parent"
+            className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-emerald-500"
+          >
+            부모 화면 체험
+          </a>
+          <a
+            href="/api/demo?role=child"
+            className="rounded-full border border-emerald-700 px-4 py-2 text-sm font-semibold text-emerald-300 transition hover:bg-emerald-500/10"
+          >
+            자녀 화면 체험
+          </a>
+        </div>
+      </section>
+
       <section className="rounded-xl border border-neutral-800 p-4">
         <h2 className="text-sm font-semibold text-neutral-300">이렇게 씁니다</h2>
         <ol className="mt-2 space-y-1.5 text-sm leading-relaxed text-neutral-400">
