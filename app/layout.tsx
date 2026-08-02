@@ -26,6 +26,8 @@ export default function RootLayout({
   return (
     <html
       lang="ko"
+      // 브라우저 기본 UI(스크롤바·폼 컨트롤)도 다크로 맞춘다.
+      style={{ colorScheme: "dark" }}
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">{children}</body>
