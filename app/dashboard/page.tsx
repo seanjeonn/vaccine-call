@@ -3,10 +3,16 @@ import Link from "next/link";
 import { prisma } from "@/lib/db";
 import { requireChild } from "@/lib/auth";
 import { getScenario } from "@/lib/scenarios";
-import { SEVERITY_BADGE_CLASSES, SEVERITY_LABELS, type TrainingReport } from "@/lib/report";
+import {
+  SEVERITY_BADGE_CLASSES,
+  SEVERITY_LABELS,
+  recurringTags,
+  type TrainingReport,
+} from "@/lib/report";
 import LogoutButton from "@/components/logout-button";
 import InvitePanel from "@/components/invite-panel";
 import ParentCard from "@/components/parent-card";
+import ParentTrend, { type TrendRound } from "@/components/parent-trend";
 import NotificationList from "@/components/notification-list";
 
 export const metadata: Metadata = { title: "보호자 대시보드 · 백신콜" };
@@ -33,8 +39,15 @@ export default async function DashboardPage() {
     prisma.report.findMany({
       where: { parent: { childId } },
       orderBy: { createdAt: "desc" },
-      take: 20,
-      include: { parent: { select: { name: true } } },
+      take: 50,
+      select: {
+        id: true,
+        parentId: true,
+        scenarioId: true,
+        report: true,
+        createdAt: true,
+        parent: { select: { name: true } },
+      },
     }),
     prisma.notification.findMany({
       where: { childId },
@@ -42,6 +55,28 @@ export default async function DashboardPage() {
       take: 20,
     }),
   ]);
+
+  // 회차 비교는 부모별로 따진다 (F1-5). 시나리오가 달라도 같은 흐름으로 본다.
+  const trends = (child?.parents ?? [])
+    .map((parent) => {
+      const own = reports.filter((r) => r.parentId === parent.id).reverse(); // 오래된 회차부터
+      return {
+        id: parent.id,
+        name: parent.name,
+        rounds: own.map<TrendRound>((row) => {
+          const report = row.report as unknown as TrainingReport;
+          return {
+            id: row.id,
+            scenarioLabel: getScenario(row.scenarioId).label,
+            overallRisk: report.overallRisk,
+            riskMomentCount: report.riskMoments.length,
+            dateLabel: row.createdAt.toLocaleDateString("ko-KR"),
+          };
+        }),
+        recurring: recurringTags(own.map((row) => row.report as unknown as TrainingReport)),
+      };
+    })
+    .filter((t) => t.rounds.length >= 2);
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-2xl flex-col gap-8 px-6 py-10">
@@ -90,6 +125,22 @@ export default async function DashboardPage() {
           </p>
         )}
       </section>
+
+      {trends.length > 0 && (
+        <section>
+          <h2 className="mb-2 text-sm font-semibold text-neutral-300">회차별 추이</h2>
+          <ul className="space-y-2">
+            {trends.map((trend) => (
+              <ParentTrend
+                key={trend.id}
+                name={trend.name}
+                rounds={trend.rounds}
+                recurring={trend.recurring}
+              />
+            ))}
+          </ul>
+        </section>
+      )}
 
       <InvitePanel />
 

@@ -65,6 +65,42 @@ const RISKY_REPORT = {
   ],
 };
 
+const LOAN_MESSAGES = [
+  {
+    role: "assistant",
+    content:
+      "고객님, 저금리 대출 전환 대상자로 선정되셨습니다. 기존 대출을 먼저 상환하셔야 승인이 납니다.",
+  },
+  { role: "user", content: "이자가 얼마나 낮아지는데요?" },
+  { role: "assistant", content: "심사를 위해 통장 계좌번호를 알려주시겠어요?" },
+  { role: "user", content: "계좌번호는 123-456-7890이에요." },
+  { role: "assistant", content: "그럼 상환금 500만원을 지금 보내주시면 됩니다." },
+  { role: "user", content: "돈 보내는 건 좀 아닌 것 같은데요. 자식한테 물어보고 다시 연락할게요." },
+];
+
+const LOAN_REPORT = {
+  overallRisk: "medium",
+  riskMoments: [
+    {
+      turnIndex: 3,
+      tags: ["personal_info"],
+      severity: "medium",
+      quote: "계좌번호는 123-456-7890이에요.",
+      explanation: "심사를 핑계로 요구한 계좌번호를 그대로 알려주었습니다.",
+    },
+  ],
+  diagnosis: {
+    vulnerabilityType: "개인정보를 쉽게 내주는 유형",
+    summary:
+      "송금 요구는 거절하셨지만, 계좌번호는 의심 없이 알려주셨습니다. 지난 훈련에 이어 개인정보 노출이 반복되고 있습니다.",
+  },
+  tips: [
+    "대출 심사에 계좌번호가 먼저 필요한 경우는 없습니다.",
+    "기존 대출을 먼저 갚아야 한다는 말은 대출 사기의 대표 수법입니다.",
+    "돈을 거절한 것처럼, 개인정보도 똑같이 거절하셔도 됩니다.",
+  ],
+};
+
 const SAFE_MESSAGES = [
   {
     role: "assistant",
@@ -110,45 +146,61 @@ async function main() {
     });
   }
 
-  // 리포트·알림은 이미 있으면 다시 만들지 않는다.
-  const existing = await prisma.report.count({ where: { parentId: parent.id } });
-  if (existing === 0) {
-    const risky = await prisma.report.create({
-      data: {
-        parentId: parent.id,
-        scenarioId: "institution",
-        report: RISKY_REPORT,
-        messages: RISKY_MESSAGES,
-      },
-    });
-    const safe = await prisma.report.create({
-      data: {
-        parentId: parent.id,
-        scenarioId: "family",
-        report: SAFE_REPORT,
-        messages: SAFE_MESSAGES,
-      },
-    });
+  // 회차 추이(F1-5)를 보여주려면 순서가 분명해야 해서, 매번 지우고 날짜를 지정해 다시 만든다.
+  await prisma.notification.deleteMany({ where: { childId: child.id } });
+  await prisma.report.deleteMany({ where: { parentId: parent.id } });
 
-    await prisma.notification.createMany({
-      data: [
-        {
-          childId: child.id,
-          reportId: safe.id,
-          type: "report",
-          title: "어머니님이 훈련을 마쳤어요",
-          body: SAFE_REPORT.diagnosis.summary,
-        },
-        {
-          childId: child.id,
-          reportId: risky.id,
-          type: "risk",
-          title: "어머니님의 훈련에서 위험 신호가 있었어요",
-          body: RISKY_REPORT.diagnosis.summary,
-        },
-      ],
-    });
-  }
+  const daysAgo = (days) => new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  // 위험 높음 → 주의 → 낮음으로 개선되지만, 개인정보 노출은 1·2회차에 반복된다.
+  const risky = await prisma.report.create({
+    data: {
+      parentId: parent.id,
+      scenarioId: "institution",
+      report: RISKY_REPORT,
+      messages: RISKY_MESSAGES,
+      createdAt: daysAgo(7),
+    },
+  });
+  await prisma.report.create({
+    data: {
+      parentId: parent.id,
+      scenarioId: "loan",
+      report: LOAN_REPORT,
+      messages: LOAN_MESSAGES,
+      createdAt: daysAgo(3),
+    },
+  });
+  const safe = await prisma.report.create({
+    data: {
+      parentId: parent.id,
+      scenarioId: "family",
+      report: SAFE_REPORT,
+      messages: SAFE_MESSAGES,
+      createdAt: daysAgo(1),
+    },
+  });
+
+  await prisma.notification.createMany({
+    data: [
+      {
+        childId: child.id,
+        reportId: safe.id,
+        type: "report",
+        title: "어머니님이 훈련을 마쳤어요",
+        body: SAFE_REPORT.diagnosis.summary,
+        createdAt: daysAgo(1),
+      },
+      {
+        childId: child.id,
+        reportId: risky.id,
+        type: "risk",
+        title: "어머니님의 훈련에서 위험 신호가 있었어요",
+        body: RISKY_REPORT.diagnosis.summary,
+        createdAt: daysAgo(7),
+      },
+    ],
+  });
 
   console.log(`데모 계정 준비 완료: ${DEMO_EMAIL} / ${DEMO_PASSWORD}`);
   console.log(`  부모: ${parent.name} (${parent.ageGroup})`);

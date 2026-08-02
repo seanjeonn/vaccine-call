@@ -114,7 +114,8 @@ docs/                          # 기획·조사·PoC 결과 문서
 - [x] Vercel 배포 (https://vaccine-call.vercel.app)
 - [x] F1-2 음성 모의 훈련 · F1-3 훈련 분석 리포트
 - [x] F2 보호자 연동 — 초대·리포트 공유·알림함
-- [ ] F1-1 프로필 기반 맞춤 시나리오 · F1-4 훈련 중 개입 · F1-5 이력 추이
+- [x] F1-5 훈련 이력 추이 — 회차 비교·반복 취약 유형
+- [ ] F1-1 프로필 기반 맞춤 시나리오 · F1-4 훈련 중 개입
 - [ ] F3 실시간 통화 코파일럿 · F4 피해구제 AI 사무장
 
 작업 규칙은 [`docs/github-workflow.md`](docs/github-workflow.md), 프로젝트 지침은 [`CLAUDE.md`](CLAUDE.md) 참고.
