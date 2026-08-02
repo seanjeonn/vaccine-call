@@ -68,3 +68,30 @@ export const SEVERITY_RING_CLASSES: Record<Severity, string> = {
   medium: "ring-2 ring-amber-500/60",
   high: "ring-2 ring-red-500/70",
 };
+
+// 회차 비교(F1-5). 위험도를 서수로 바꿔 지난 회차와 견준다.
+const SEVERITY_RANK: Record<Severity, number> = { low: 0, medium: 1, high: 2 };
+
+export type RiskTrend = "improved" | "worse" | "same";
+
+export const compareRisk = (prev: Severity, next: Severity): RiskTrend => {
+  const diff = SEVERITY_RANK[next] - SEVERITY_RANK[prev];
+  if (diff < 0) return "improved";
+  if (diff > 0) return "worse";
+  return "same";
+};
+
+// 여러 회차에 걸쳐 반복된 위험 태그. 같은 회차 안의 중복은 1회로 센다.
+export const recurringTags = (
+  reports: TrainingReport[],
+): { tag: RiskTagId; count: number }[] => {
+  const counts = new Map<RiskTagId, number>();
+  for (const report of reports) {
+    const seen = new Set(report.riskMoments.flatMap((moment) => moment.tags));
+    for (const tag of seen) counts.set(tag, (counts.get(tag) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .map(([tag, count]) => ({ tag, count }));
+};
