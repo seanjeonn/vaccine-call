@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
+import type { Prisma } from "@prisma/client";
 import { getScenario } from "@/lib/scenarios";
+import { prisma } from "@/lib/db";
+import { getSession } from "@/lib/auth";
 import {
   RISK_TAG_CRITERIA,
   RISK_TAG_IDS,
@@ -82,6 +85,49 @@ ${tagLines}
 - tips는 이번 시나리오 수법에 맞춘 구체적인 예방 수칙 3개, 각 한 문장.`;
 }
 
+// 부모 세션이면 리포트를 남기고 자녀에게 알린다. 체험 모드(세션 없음)면 아무것도 하지 않는다.
+// 저장이 실패해도 리포트 자체는 돌려줘야 하므로 여기서 오류를 삼킨다.
+async function persist(
+  report: TrainingReport,
+  messages: ChatMessage[],
+  scenario: string | undefined,
+): Promise<string | undefined> {
+  try {
+    const session = await getSession();
+    if (session?.role !== "parent" || !session.parentId) return undefined;
+
+    const parent = await prisma.parent.findUnique({ where: { id: session.parentId } });
+    if (!parent) return undefined;
+
+    const saved = await prisma.report.create({
+      data: {
+        parentId: parent.id,
+        scenarioId: getScenario(scenario).id,
+        report: report as unknown as Prisma.InputJsonValue,
+        messages: messages as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    const risky = report.overallRisk === "high";
+    await prisma.notification.create({
+      data: {
+        childId: parent.childId,
+        reportId: saved.id,
+        type: risky ? "risk" : "report",
+        title: risky
+          ? `${parent.name}님의 훈련에서 위험 신호가 있었어요`
+          : `${parent.name}님이 훈련을 마쳤어요`,
+        body: report.diagnosis.summary,
+      },
+    });
+
+    return saved.id;
+  } catch (err) {
+    console.error("[report] persist failed", err);
+    return undefined;
+  }
+}
+
 // 녹취록을 인덱스가 붙은 형태로 만든다. LLM이 turnIndex를 정확히 지목하게 하려는 목적.
 function formatTranscript(messages: ChatMessage[]) {
   return messages
@@ -148,7 +194,10 @@ export async function POST(req: NextRequest) {
         messages[m.turnIndex]?.role === "user",
     );
 
-    return NextResponse.json({ report: { ...parsed, riskMoments } });
+    const report = { ...parsed, riskMoments };
+    const reportId = await persist(report, messages, scenario);
+
+    return NextResponse.json({ report, reportId });
   } catch (err) {
     console.error("[report] error", err);
     const detail = err instanceof Error ? err.message : String(err);
