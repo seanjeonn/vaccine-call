@@ -62,6 +62,8 @@ export default function Home() {
   const [reportPhase, setReportPhase] = useState<ReportPhase>("none");
   const [report, setReport] = useState<TrainingReport | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
+  // 부모로 로그인한 경우에만 서버가 리포트를 저장하고 id를 돌려준다.
+  const [reportShared, setReportShared] = useState(false);
   const reportAbortRef = useRef<AbortController | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -96,6 +98,7 @@ export default function Home() {
     setReportPhase("none");
     setReport(null);
     setReportError(null);
+    setReportShared(false);
   }, []);
 
   // 통화 종료 후 대화 기록을 분석해 훈련 리포트를 만든다.
@@ -105,6 +108,7 @@ export default function Home() {
       if (!transcript.some((m) => m.role === "user")) {
         setReport(null);
         setReportError(null);
+        setReportShared(false);
         setReportPhase("ready");
         return;
       }
@@ -113,6 +117,7 @@ export default function Home() {
       reportAbortRef.current = controller;
       setReport(null);
       setReportError(null);
+      setReportShared(false);
       setReportPhase("loading");
 
       try {
@@ -126,6 +131,7 @@ export default function Home() {
         if (controller.signal.aborted) return;
         if (!res.ok) throw new Error(data.error ?? "리포트를 만들지 못했습니다.");
         setReport(data.report as TrainingReport);
+        setReportShared(Boolean(data.reportId));
         setReportPhase("ready");
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") return;
@@ -647,11 +653,18 @@ export default function Home() {
               </p>
             </div>
           ) : reportPhase === "ready" && report ? (
-            <TrainingReportView
-              report={report}
-              messages={messages}
-              scenarioLabel={scenario?.label}
-            />
+            <div className="flex flex-1 flex-col overflow-hidden">
+              {reportShared && (
+                <p className="bg-emerald-500/15 px-4 py-2 text-center text-[13px] text-emerald-300">
+                  이 결과가 자녀분께 전달되었어요.
+                </p>
+              )}
+              <TrainingReportView
+                report={report}
+                messages={messages}
+                scenarioLabel={scenario?.label}
+              />
+            </div>
           ) : reportPhase === "ready" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
               <span className="text-4xl">🙂</span>

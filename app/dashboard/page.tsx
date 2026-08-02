@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { prisma } from "@/lib/db";
 import { requireChild } from "@/lib/auth";
 import LogoutButton from "@/components/logout-button";
+import InvitePanel from "@/components/invite-panel";
 
 export const metadata: Metadata = { title: "보호자 대시보드 · 백신콜" };
 
@@ -21,6 +22,8 @@ export default async function DashboardPage() {
         </div>
         <LogoutButton />
       </header>
+
+      <InvitePanel />
 
       <section>
         <h2 className="text-sm font-semibold text-neutral-300">등록된 부모님</h2>
