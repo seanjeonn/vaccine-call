@@ -13,8 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "백신콜 · 음성 대화 PoC",
-  description: "STT → LLM → TTS 턴제 음성 대화 기술 검증 데모",
+  title: "백신콜 — 사기 전화, 미리 맞는 예방주사",
+  description:
+    "AI가 사기꾼을 연기하는 보이스피싱 모의 훈련. 훈련 결과를 자녀와 함께 확인하세요.",
 };
 
 export default function RootLayout({
@@ -25,6 +26,8 @@ export default function RootLayout({
   return (
     <html
       lang="ko"
+      // 브라우저 기본 UI(스크롤바·폼 컨트롤)도 다크로 맞춘다.
+      style={{ colorScheme: "dark" }}
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">{children}</body>

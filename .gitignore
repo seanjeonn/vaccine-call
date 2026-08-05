@@ -43,3 +43,9 @@ graphify-out/
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# neon 통합이 자동 설치하는 에이전트 스킬 (로컬 도구, 저장소 대상 아님)
+.agents/
+skills-lock.json
+.claude/skills/neon
+.claude/skills/neon-postgres

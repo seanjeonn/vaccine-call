@@ -1,8 +1,10 @@
 @import "tailwindcss";
 
+/* 통화 화면이 다크 팔레트를 전제로 만들어져 있어, 서비스 전체를 다크로 고정한다.
+   라이트 모드에서는 어두운 카드 위에 어두운 글씨가 얹혀 읽을 수 없었다. */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0a0a0a;
+  --foreground: #ededed;
 }
 
 @theme inline {
@@ -12,15 +14,35 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
+
+/* 피해구제 서류 인쇄(F4-2). 화면은 다크지만 종이는 흰 바탕이어야 한다. */
+@media print {
+  body {
+    background: #fff;
+    color: #000;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-sheet {
+    margin: 0;
+    padding: 0;
+    border-radius: 0;
+  }
+
+  .print-page {
+    break-inside: avoid;
+    break-after: page;
+  }
+
+  .print-page:last-child {
+    break-after: auto;
+  }
 }

@@ -1,0 +1,133 @@
+// 백신콜 데이터 모델.
+// 실명·계좌번호 등 민감정보는 저장하지 않는다 (PRD §5). 부모의 name은 호칭이다.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // Neon pooled
+  directUrl = env("DATABASE_URL_UNPOOLED") // migrate 전용 직결
+}
+
+// 자녀(보호자) 계정. 유일하게 가입·로그인하는 주체.
+model Child {
+  id            String         @id @default(cuid())
+  email         String         @unique
+  passwordHash  String // "salt:hash" (scrypt, hex)
+  createdAt     DateTime       @default(now())
+  parents       Parent[]
+  invites       Invite[]
+  notifications Notification[]
+}
+
+// 부모(피보호자). 가입하지 않고 초대 링크로만 생성된다.
+model Parent {
+  id        String   @id @default(cuid())
+  childId   String
+  child     Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+  name         String // 호칭 ("어머니" 등)
+  ageGroup     String // lib/parent.ts의 AGE_GROUPS
+  // 맞춤 시나리오 생성용 선택 항목 (F1-1). 미입력이면 정적 시나리오로 훈련한다.
+  bank         String? // lib/parent.ts의 BANKS
+  family       String? // lib/parent.ts의 FAMILY_OPTIONS
+  createdAt    DateTime @default(now())
+  reports      Report[]
+  recoveryCase RecoveryCase?
+  liveCalls    LiveCall[]
+
+  @@index([childId])
+}
+
+// 피해구제 사건(F4). 부모당 1건만 둔다 — 진행 중인 사건은 하나라는 전제로
+// 모든 화면이 단일 조회로 끝난다. 다시 시작하면 같은 행을 덮어쓴다.
+// answers·documents에는 실명·계좌번호 등 민감정보를 저장하지 않는다 (PRD §5).
+model RecoveryCase {
+  id         String   @id @default(cuid())
+  parentId   String   @unique
+  parent     Parent   @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  method     String // lib/recovery.ts의 DamageMethod — 체크리스트 분기 기준
+  incidentAt DateTime // 피해(송금) 시각. 모든 데드라인이 여기서 계산된다
+  stepsDone  Json     @default("[]") // 완료한 StepId 배열
+  answers    Json? // InterviewAnswers — 서류 문답 결과
+  documents  Json? // RecoveryDocuments — 생성된 서류 초안
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// 부모 초대 토큰. 1회용이며 만료된다. 재발급은 새 행을 만든다.
+model Invite {
+  token     String    @id
+  childId   String
+  child     Child     @relation(fields: [childId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  @@index([childId])
+}
+
+// 자녀·부모 공용 세션. 역할에 따라 childId 또는 parentId 중 하나가 채워진다.
+model Session {
+  token     String   @id
+  role      String // "child" | "parent"
+  childId   String?
+  parentId  String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+// 실시간 통화 세션(F3). 코파일럿이 분석 틱마다 갱신하고 자녀 대시보드가 폴링으로 읽는다.
+// 훈련(Report)과 달리 통화가 끝나기 전에도 행이 존재해야 자녀가 진행 중인 상황을 볼 수 있다.
+model LiveCall {
+  id         String    @id @default(cuid())
+  parentId   String
+  parent     Parent    @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  status     String    @default("active") // "active" | "ended"
+  mode       String    @default("live") // "live"(마이크 청취) | "sim"(체험 모드)
+  stage      String    @default("none") // lib/copilot.ts의 CopilotStage
+  risk       Int       @default(0) // 0~100
+  scamType   String    @default("unknown") // ScenarioId | "unknown"
+  summary    String    @default("") // 자녀에게 보여줄 현재 상황 한 줄
+  transcript Json      @default("[]") // CopilotLine[] — 화자 라벨이 붙은 통화 내용
+  reportId   String? // 통화 종료 후 만들어진 Report
+  alertedAt  DateTime? // 위험 알림은 통화당 1회 — 재발송 가드
+  startedAt  DateTime  @default(now())
+  // 분석 틱마다 갱신된다. 부모가 통화 도중 브라우저를 닫으면 종료 신호가 오지 않으므로,
+  // 자녀 화면은 이 시각을 보고 "아직 통화 중"인지 판단한다.
+  updatedAt  DateTime  @updatedAt
+  endedAt    DateTime?
+
+  @@index([parentId, startedAt(sort: Desc)])
+}
+
+// 훈련 리포트. messages는 리포트 화면의 대화 타임라인 렌더에 필요하다.
+// 실제 의심 전화 분석(F3-4)도 같은 표에 남는다 — 포맷이 같아 화면을 그대로 재사용한다.
+model Report {
+  id         String   @id @default(cuid())
+  parentId   String
+  parent     Parent   @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  scenarioId String
+  source     String   @default("training") // "training"(모의 훈련) | "live"(실제 의심 전화)
+  report     Json // lib/report.ts의 TrainingReport
+  messages   Json
+  createdAt  DateTime @default(now())
+
+  @@index([parentId, createdAt(sort: Desc)])
+}
+
+// 자녀 인앱 알림함. 웹 푸시는 범위 외.
+model Notification {
+  id        String    @id @default(cuid())
+  childId   String
+  child     Child     @relation(fields: [childId], references: [id], onDelete: Cascade)
+  reportId  String?
+  type      String // lib/notifications.ts의 NotificationType
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([childId, createdAt(sort: Desc)])
+}

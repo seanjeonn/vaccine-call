@@ -14,6 +14,9 @@ type Props = {
   report: TrainingReport;
   messages: Message[];
   scenarioLabel?: string;
+  // 실제 의심 전화 분석(F3-4)도 같은 화면을 쓴다. 그때는 "훈련"이라고 부르면 안 된다.
+  title?: string;
+  subtitle?: string;
 };
 
 // 훈련 종료 후 분석 리포트. 진단 → 위험 순간 타임라인 → 예방 팁 순으로 보여준다.
@@ -21,6 +24,8 @@ export default function TrainingReportView({
   report,
   messages,
   scenarioLabel,
+  title = "훈련 분석 리포트",
+  subtitle,
 }: Props) {
   const momentByTurn = new Map(report.riskMoments.map((m) => [m.turnIndex, m]));
 
@@ -29,7 +34,7 @@ export default function TrainingReportView({
       {/* 진단 */}
       <section className="rounded-xl bg-neutral-900 p-4">
         <div className="flex items-center justify-between gap-2">
-          <h2 className="text-base font-semibold">훈련 분석 리포트</h2>
+          <h2 className="text-base font-semibold">{title}</h2>
           <span
             className={
               "rounded px-2 py-0.5 text-[11px] font-medium " +
@@ -39,8 +44,10 @@ export default function TrainingReportView({
             위험도 {SEVERITY_LABELS[report.overallRisk]}
           </span>
         </div>
-        {scenarioLabel && (
-          <div className="mt-1 text-[11px] text-neutral-500">{scenarioLabel} 훈련</div>
+        {(subtitle || scenarioLabel) && (
+          <div className="mt-1 text-[11px] text-neutral-500">
+            {subtitle ?? `${scenarioLabel} 훈련`}
+          </div>
         )}
         <p className="mt-3 text-sm font-semibold text-neutral-100">
           {report.diagnosis.vulnerabilityType}
