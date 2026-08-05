@@ -19,3 +19,30 @@ body {
   color: var(--foreground);
   font-family: var(--font-geist-sans), system-ui, sans-serif;
 }
+
+/* 피해구제 서류 인쇄(F4-2). 화면은 다크지만 종이는 흰 바탕이어야 한다. */
+@media print {
+  body {
+    background: #fff;
+    color: #000;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-sheet {
+    margin: 0;
+    padding: 0;
+    border-radius: 0;
+  }
+
+  .print-page {
+    break-inside: avoid;
+    break-after: page;
+  }
+
+  .print-page:last-child {
+    break-after: auto;
+  }
+}
