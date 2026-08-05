@@ -71,6 +71,7 @@ const SYSTEM_PROMPT = `당신은 지금 진행 중인 실제 전화 통화를 �
 
 작업 1 — 화자 분리
 새로 들어온 발화를 문장 단위로 나눠 caller(전화를 건 상대방)와 victim(전화를 받은 어르신)으로 표시하세요. 내용으로 판단하면 됩니다. 지시하고 요구하는 쪽이 caller, 대답하고 되묻는 쪽이 victim입니다.
+lines에는 **이번에 새로 들어온 발화만** 넣으세요. "지금까지의 통화"에 이미 있는 문장은 절대 다시 넣지 마세요.
 
 작업 2 — 사기 진행 단계(stage)
 보이스피싱은 아래 각본을 순서대로 밟습니다. 통화 전체 맥락에서 가장 진행된 신호를 고르세요.
@@ -138,6 +139,7 @@ export async function POST(req: NextRequest) {
     }
 
     const transcript = (call.transcript as unknown as CopilotLine[]) ?? [];
+    const context = transcript.slice(-CONTEXT_LINES);
     const prevStage = call.stage as CopilotStage;
 
     const openai = new OpenAI();
@@ -154,7 +156,7 @@ export async function POST(req: NextRequest) {
         {
           role: "user",
           content: [
-            `지금까지의 통화:\n${formatContext(transcript.slice(-CONTEXT_LINES))}`,
+            `지금까지의 통화:\n${formatContext(context)}`,
             `\n이전 판정: 단계 ${prevStage} · 위험도 ${call.risk}`,
             prelabeled
               ? `\n새로 들어온 발화(화자 확인됨):\n${formatContext(newLines)}`
@@ -171,7 +173,14 @@ export async function POST(req: NextRequest) {
     const parsed = JSON.parse(raw) as CopilotAnalysis;
 
     // 화자가 확정된 입력은 LLM이 다시 쓰게 두지 않는다.
-    const lines = prelabeled ? newLines : parsed.lines;
+    // 화자 미상 입력에서는 모델이 앞서 나온 문장까지 되풀이해 뱉는 일이 있다. 그대로 쌓으면
+    // 통화 기록이 부풀고 종료 후 리포트가 같은 말을 여러 번 분석한다. 맥락으로 넘긴 구간과
+    // 겹치는 줄은 버린다. (짧은 맞장구가 실제로 반복되면 한 번은 잃지만, 기록이 어긋나는
+    // 쪽이 훨씬 나쁘다)
+    const contextTexts = new Set(context.map((l) => l.text.trim()));
+    const lines = prelabeled
+      ? newLines
+      : parsed.lines.filter((l) => !contextTexts.has(l.text.trim()));
     // 게이지가 깜빡이지 않도록 한 틱에 내려갈 수 있는 폭을 제한한다.
     const risk = Math.max(
       0,
