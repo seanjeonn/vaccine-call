@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { SCENARIOS, type Scenario } from "@/lib/scenarios";
 import type { TrainingReport } from "@/lib/report";
 import TrainingReportView from "@/components/training-report";
+import InterventionScreen, { type Interruption } from "@/components/intervention-screen";
 
 type Role = "user" | "assistant";
 type Message = { role: Role; content: string };
@@ -66,6 +67,9 @@ export default function Home() {
   const [reportShared, setReportShared] = useState(false);
   const reportAbortRef = useRef<AbortController | null>(null);
 
+  // 훈련 중 개입(F1-4). 값이 있으면 통화를 멈추고 정지 화면을 띄운다.
+  const [interruption, setInterruption] = useState<Interruption | null>(null);
+
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
@@ -99,6 +103,7 @@ export default function Home() {
     setReport(null);
     setReportError(null);
     setReportShared(false);
+    setInterruption(null);
   }, []);
 
   // 통화 종료 후 대화 기록을 분석해 훈련 리포트를 만든다.
@@ -187,6 +192,8 @@ export default function Home() {
   const failCall = useCallback(
     (message: string) => {
       console.error(message);
+      // 이미 끝난 통화(종료·개입)에서 뒤늦게 도착한 실패가 정지·리포트 화면을 덮어쓰지 않게 한다.
+      if (!callActiveRef.current) return;
       setError(message);
       teardown();
       scenarioRef.current = null;
@@ -194,6 +201,54 @@ export default function Home() {
       setStatus("idle");
     },
     [teardown],
+  );
+
+  // 위험 발화가 확인되면 통화를 즉시 끊고 정지 화면을 띄운다 (F1-4).
+  // 리포트는 여기서 미리 돌려둔다. 사용자가 정지 화면을 읽는 동안 분석이 끝난다.
+  const interruptCall = useCallback(
+    (verdict: Interruption) => {
+      // 이미 끝난 통화의 뒤늦은 판정은 버린다. (리포트가 두 번 생성되는 것을 막는다)
+      if (!callActiveRef.current) return;
+      const transcript = messagesRef.current;
+      const scenarioId = scenarioRef.current?.id;
+      teardown();
+      setStatus("idle");
+      setInterruption(verdict);
+      void generateReport(transcript, scenarioId);
+    },
+    [teardown, generateReport],
+  );
+
+  // 사용자 발화 한 턴이 결정적 위험인지 판정한다. 사기꾼 응답과 병렬로 돈다.
+  // 판정 실패는 훈련을 방해하면 안 되므로 전부 조용히 삼킨다.
+  const checkGuard = useCallback(
+    async (utterance: string, history: Message[]) => {
+      try {
+        const lastAssistant = [...history]
+          .reverse()
+          .find((m) => m.role === "assistant")?.content;
+        const res = await fetch("/api/guard", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: utterance,
+            lastAssistant,
+            scenario: scenarioRef.current?.id,
+          }),
+        });
+        if (!res.ok) return;
+        const verdict = (await res.json()) as Interruption & { intervene: boolean };
+        if (!verdict.intervene) return;
+        interruptCall({
+          tag: verdict.tag,
+          quote: verdict.quote,
+          consequence: verdict.consequence,
+        });
+      } catch (err) {
+        console.error("[guard] 판정 실패", err);
+      }
+    },
+    [interruptCall],
   );
 
   // 통화 연결음(ringback)을 오실레이터로 합성해 즉시 울린다. 오프닝 대기 체감을 줄인다.
@@ -418,12 +473,15 @@ export default function Home() {
           { role: "user", content: userText },
         ];
         setConversation(history);
+        // 위험 판정은 응답 생성과 병렬로 돈다. 직렬로 두면 판정 시간이 첫 소리까지의
+        // 지연에 그대로 더해진다. 위험하면 사기꾼이 말하는 도중에 통화가 끊긴다.
+        void checkGuard(userText, history);
         await assistantRespond(history, t0, sttMs);
       } catch (err) {
         failCall(err instanceof Error ? err.message : "알 수 없는 오류");
       }
     },
-    [assistantRespond, failCall, setConversation],
+    [assistantRespond, checkGuard, failCall, setConversation],
   );
 
   // 무음 감지(VAD) 루프. 발화 후 침묵이 이어지면 녹음을 멈춰 턴을 종료한다.
@@ -585,7 +643,9 @@ export default function Home() {
   const inCall = status !== "idle";
   // 통화가 끝나고 리포트 흐름이 살아 있는 동안은 "다시 훈련하기"로 전환한다.
   const showingReport = !inCall && reportPhase !== "none";
-  const statusLine = showingReport
+  const statusLine = interruption
+    ? "훈련을 멈췄어요"
+    : showingReport
     ? reportPhase === "loading"
       ? "통화 종료 · 분석 중"
       : "훈련이 끝났어요"
@@ -615,7 +675,7 @@ export default function Home() {
           {/* 통화 화면 헤더 */}
           <div className="border-b border-neutral-800 px-5 pb-3 pt-8 text-center">
             <div className="text-sm text-neutral-400">
-              {inCall ? "통화 중" : "수신 전화"}
+              {inCall ? "통화 중" : interruption ? "통화 중단됨" : "수신 전화"}
             </div>
             <div className="text-lg font-semibold">
               {scenario ? scenario.caller.name : "모의 훈련 대기"}
@@ -633,7 +693,7 @@ export default function Home() {
             </div>
           </div>
 
-          {/* 통화음(연결 중)에는 연결 화면, 통화가 끝나면 리포트, 그 외에는 대화 로그 */}
+          {/* 통화음(연결 중)에는 연결 화면, 개입 시 정지 화면, 통화가 끝나면 리포트, 그 외에는 대화 로그 */}
           {status === "connecting" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-4 px-4">
               <div className="flex h-20 w-20 animate-pulse items-center justify-center rounded-full bg-emerald-600/20">
@@ -642,6 +702,8 @@ export default function Home() {
               <p className="text-base font-medium text-neutral-200">연결 중…</p>
               <p className="text-xs text-neutral-500">잠시만 기다려 주세요</p>
             </div>
+          ) : interruption ? (
+            <InterventionScreen interruption={interruption} />
           ) : reportPhase === "loading" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-4 px-4">
               <div className="flex h-20 w-20 animate-pulse items-center justify-center rounded-full bg-blue-600/20">
@@ -723,7 +785,13 @@ export default function Home() {
             <p className="mb-2 text-center text-xs text-neutral-400">{statusLine}</p>
             <button
               onClick={
-                inCall ? endCall : showingReport ? reset : () => void startCall()
+                inCall
+                  ? endCall
+                  : interruption
+                    ? () => setInterruption(null) // 정지 화면 → 리포트 (리포트는 이미 돌고 있다)
+                    : showingReport
+                      ? reset
+                      : () => void startCall()
               }
               className={
                 "flex w-full items-center justify-center gap-2 rounded-full py-4 text-base font-semibold transition " +
@@ -732,7 +800,13 @@ export default function Home() {
                   : "bg-emerald-600 text-white hover:bg-emerald-500")
               }
             >
-              {inCall ? "통화 종료" : showingReport ? "다시 훈련하기" : "통화 시작"}
+              {inCall
+                ? "통화 종료"
+                : interruption
+                  ? "리포트 보기"
+                  : showingReport
+                    ? "다시 훈련하기"
+                    : "통화 시작"}
             </button>
           </div>
         </div>
