@@ -53,6 +53,14 @@ export default async function ParentHomePage() {
         훈련 시작하기
       </Link>
 
+      {/* 지금 의심 전화를 받고 있는 사람을 위한 입구(F3). 훈련보다 급하고 피해보다는 이르다. */}
+      <Link
+        href="/p/copilot"
+        className="rounded-full bg-amber-500 py-8 text-center text-3xl font-bold text-neutral-950 transition hover:bg-amber-400"
+      >
+        의심 전화가 왔어요
+      </Link>
+
       {/* 피해가 이미 난 사람을 위한 입구(F4). 훈련보다 급한 일이라 항상 보이게 둔다. */}
       <Link
         href="/p/recovery"

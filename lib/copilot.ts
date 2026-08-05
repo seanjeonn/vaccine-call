@@ -22,6 +22,10 @@ export const COPILOT_STAGES: CopilotStage[] = [
   "extraction",
 ];
 
+// 단계가 앞으로 나아갔는지 견주는 데 쓴다. 되돌아간 판정은 안내를 다시 띄우지 않는다.
+export const stageRank = (stage: CopilotStage): number =>
+  stage === "none" ? 0 : COPILOT_STAGES.indexOf(stage) + 1;
+
 export const STAGE_LABELS: Record<CopilotStage, string> = {
   none: "안전",
   approach: "접근",
