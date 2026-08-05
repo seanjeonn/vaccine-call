@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { SCENARIOS, type Scenario } from "@/lib/scenarios";
+import { randomScenario, type Scenario } from "@/lib/scenarios";
 import type { TrainingReport } from "@/lib/report";
 import TrainingReportView from "@/components/training-report";
 import InterventionScreen, { type Interruption } from "@/components/intervention-screen";
@@ -108,7 +108,7 @@ export default function Home() {
 
   // 통화 종료 후 대화 기록을 분석해 훈련 리포트를 만든다.
   const generateReport = useCallback(
-    async (transcript: Message[], scenarioId: string | undefined) => {
+    async (transcript: Message[], scenarioUsed: Scenario | null) => {
       // 사용자가 한마디도 하지 않은 통화는 분석할 것이 없다. (LLM 호출 생략)
       if (!transcript.some((m) => m.role === "user")) {
         setReport(null);
@@ -129,7 +129,7 @@ export default function Home() {
         const res = await fetch("/api/report", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: transcript, scenario: scenarioId }),
+          body: JSON.stringify({ messages: transcript, scenario: scenarioUsed }),
           signal: controller.signal,
         });
         const data = await res.json();
@@ -183,10 +183,10 @@ export default function Home() {
 
   const endCall = useCallback(() => {
     const transcript = messagesRef.current;
-    const scenarioId = scenarioRef.current?.id;
+    const scenarioUsed = scenarioRef.current;
     teardown();
     setStatus("idle");
-    void generateReport(transcript, scenarioId);
+    void generateReport(transcript, scenarioUsed);
   }, [teardown, generateReport]);
 
   const failCall = useCallback(
@@ -210,11 +210,11 @@ export default function Home() {
       // 이미 끝난 통화의 뒤늦은 판정은 버린다. (리포트가 두 번 생성되는 것을 막는다)
       if (!callActiveRef.current) return;
       const transcript = messagesRef.current;
-      const scenarioId = scenarioRef.current?.id;
+      const scenarioUsed = scenarioRef.current;
       teardown();
       setStatus("idle");
       setInterruption(verdict);
-      void generateReport(transcript, scenarioId);
+      void generateReport(transcript, scenarioUsed);
     },
     [teardown, generateReport],
   );
@@ -233,7 +233,7 @@ export default function Home() {
           body: JSON.stringify({
             text: utterance,
             lastAssistant,
-            scenario: scenarioRef.current?.id,
+            scenario: scenarioRef.current,
           }),
         });
         if (!res.ok) return;
@@ -293,7 +293,7 @@ export default function Home() {
     const res = await fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, scenario: scenarioRef.current?.id }),
+      body: JSON.stringify({ text, scenario: scenarioRef.current }),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => null);
@@ -361,7 +361,7 @@ export default function Home() {
       const chatRes = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history, scenario: scenarioRef.current?.id }),
+        body: JSON.stringify({ messages: history, scenario: scenarioRef.current }),
       });
       if (!chatRes.ok || !chatRes.body) {
         const body = await chatRes.json().catch(() => null);
@@ -568,17 +568,19 @@ export default function Home() {
     startListeningRef.current = startListening;
   }, [startListening]);
 
-  // 통화 시작: 시나리오 랜덤 배정 → 마이크 확보 → 오디오 분석 셋업 → 오프닝 대사 재생.
+  // 통화 시작: 시나리오 배정 → 마이크 확보 → 오디오 분석 셋업 → 오프닝 대사 재생.
   const startCall = useCallback(async () => {
     setError(null);
     clearReport();
     setConversation([]);
     setLatencies([]);
-    const picked = SCENARIOS[Math.floor(Math.random() * SCENARIOS.length)];
-    scenarioRef.current = picked;
-    setScenario(picked);
     setStatus("connecting");
     callActiveRef.current = true;
+    // 맞춤 시나리오 생성(F1-1)은 마이크 확보와 병렬로 띄우고 연결음이 우는 동안 기다린다.
+    // 라우트가 실패를 삼키고 정적 시나리오를 주지만, 네트워크가 끊긴 경우는 여기서 받는다.
+    const scenarioPromise = fetch("/api/scenario", { method: "POST" })
+      .then((res) => (res.ok ? (res.json() as Promise<Scenario>) : randomScenario()))
+      .catch(() => randomScenario());
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (!callActiveRef.current) {
@@ -603,7 +605,13 @@ export default function Home() {
       // 연결음 즉시 재생 → 오프닝 음성 준비되면 멈추고 재생
       startRingback(ctx);
 
-      // 오프닝: 사기꾼이 먼저 말한다. 고정 대사라 LLM 없이 TTS만 태운다.
+      // 시나리오 생성 대기. 연결음이 이 시간을 가린다.
+      const picked = await scenarioPromise;
+      if (!callActiveRef.current) return;
+      scenarioRef.current = picked;
+      setScenario(picked);
+
+      // 오프닝: 사기꾼이 먼저 말한다. 이 통화의 고정 대사라 LLM 없이 TTS만 태운다.
       const t0 = performance.now();
       await speakLine(
         picked.opening,
@@ -678,10 +686,18 @@ export default function Home() {
               {inCall ? "통화 중" : interruption ? "통화 중단됨" : "수신 전화"}
             </div>
             <div className="text-lg font-semibold">
-              {scenario ? scenario.caller.name : "모의 훈련 대기"}
+              {scenario
+                ? scenario.caller.name
+                : status === "connecting"
+                  ? "전화 거는 중"
+                  : "모의 훈련 대기"}
             </div>
             <div className="text-xs text-neutral-500">
-              {scenario ? scenario.caller.number : "발신자는 통화 시작 시 랜덤 배정"}
+              {scenario
+                ? scenario.caller.number
+                : status === "connecting"
+                  ? "발신자 확인 중…"
+                  : "발신자는 통화 시작 시 배정됩니다"}
             </div>
             {scenario && (
               <div className="mt-1 inline-block rounded bg-neutral-800 px-2 py-0.5 text-[10px] text-neutral-400">
@@ -747,7 +763,7 @@ export default function Home() {
                 )}
                 <button
                   onClick={() =>
-                    void generateReport(messages, scenarioRef.current?.id)
+                    void generateReport(messages, scenarioRef.current)
                   }
                   className="mt-2 rounded-md bg-red-500/20 px-2.5 py-1 text-[12px] font-medium text-red-200 hover:bg-red-500/30"
                 >

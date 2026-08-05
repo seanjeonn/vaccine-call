@@ -29,6 +29,9 @@ model Parent {
   child     Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
   name         String // 호칭 ("어머니" 등)
   ageGroup     String // lib/parent.ts의 AGE_GROUPS
+  // 맞춤 시나리오 생성용 선택 항목 (F1-1). 미입력이면 정적 시나리오로 훈련한다.
+  bank         String? // lib/parent.ts의 BANKS
+  family       String? // lib/parent.ts의 FAMILY_OPTIONS
   createdAt    DateTime @default(now())
   reports      Report[]
   recoveryCase RecoveryCase?

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
-import { getScenario } from "@/lib/scenarios";
+import { resolveScenario } from "@/lib/scenarios";
 import { CLERK_VOICE } from "@/lib/recovery";
 
 export const runtime = "nodejs";
@@ -13,7 +13,7 @@ export async function POST(req: NextRequest) {
     const openai = new OpenAI();
     const { text, scenario, persona } = (await req.json()) as {
       text: string;
-      scenario?: string;
+      scenario?: unknown;
       persona?: string;
     };
 
@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
     }
 
     const { voice, ttsInstructions } =
-      persona === "clerk" ? CLERK_VOICE : getScenario(scenario);
+      persona === "clerk" ? CLERK_VOICE : resolveScenario(scenario);
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,

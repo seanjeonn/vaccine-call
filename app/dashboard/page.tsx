@@ -139,6 +139,8 @@ export default async function DashboardPage() {
                 id={parent.id}
                 name={parent.name}
                 ageGroup={parent.ageGroup}
+                bank={parent.bank}
+                family={parent.family}
                 reportCount={parent._count.reports}
                 lastTrainedAt={
                   parent.reports[0]
