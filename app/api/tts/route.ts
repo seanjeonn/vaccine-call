@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
-import { getScenario } from "@/lib/scenarios";
+import { resolveScenario } from "@/lib/scenarios";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -11,7 +11,7 @@ export async function POST(req: NextRequest) {
     const openai = new OpenAI();
     const { text, scenario } = (await req.json()) as {
       text: string;
-      scenario?: string;
+      scenario?: unknown;
     };
 
     if (!text || typeof text !== "string") {
@@ -21,7 +21,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { voice, ttsInstructions } = getScenario(scenario);
+    const { voice, ttsInstructions } = resolveScenario(scenario);
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,

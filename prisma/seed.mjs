@@ -137,14 +137,14 @@ async function main() {
   });
 
   // 부모는 email 같은 고유키가 없어 이름으로 찾아 재사용한다.
-  let parent = await prisma.parent.findFirst({
-    where: { childId: child.id, name: "어머니" },
+  // 프로필(F1-1)은 심사위원이 데모로 들어오자마자 맞춤 시나리오가 걸리도록 매번 채운다.
+  const profile = { name: "어머니", ageGroup: "70대", bank: "KB국민은행", family: "아들" };
+  const found = await prisma.parent.findFirst({
+    where: { childId: child.id, name: profile.name },
   });
-  if (!parent) {
-    parent = await prisma.parent.create({
-      data: { childId: child.id, name: "어머니", ageGroup: "70대" },
-    });
-  }
+  const parent = found
+    ? await prisma.parent.update({ where: { id: found.id }, data: profile })
+    : await prisma.parent.create({ data: { childId: child.id, ...profile } });
 
   // 회차 추이(F1-5)를 보여주려면 순서가 분명해야 해서, 매번 지우고 날짜를 지정해 다시 만든다.
   await prisma.notification.deleteMany({ where: { childId: child.id } });
@@ -203,7 +203,7 @@ async function main() {
   });
 
   console.log(`데모 계정 준비 완료: ${DEMO_EMAIL} / ${DEMO_PASSWORD}`);
-  console.log(`  부모: ${parent.name} (${parent.ageGroup})`);
+  console.log(`  부모: ${parent.name} (${parent.ageGroup} · ${parent.bank} · ${parent.family})`);
   console.log(`  리포트: ${await prisma.report.count({ where: { parentId: parent.id } })}건`);
 }
 

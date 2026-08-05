@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
-import { getScenario } from "@/lib/scenarios";
+import { resolveScenario } from "@/lib/scenarios";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -17,7 +17,7 @@ export async function POST(req: NextRequest) {
     const openai = new OpenAI();
     const { messages, scenario } = (await req.json()) as {
       messages: ChatMessage[];
-      scenario?: string;
+      scenario?: unknown;
     };
 
     if (!Array.isArray(messages)) {
@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
       max_tokens: 400,
       stream: true,
       messages: [
-        { role: "system", content: getScenario(scenario).systemPrompt },
+        { role: "system", content: resolveScenario(scenario).systemPrompt },
         ...messages.map((m) => ({ role: m.role, content: m.content })),
       ],
     });
