@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { getSession } from "@/lib/auth";
 import { isDamageMethod, isStepId, type DamageMethod } from "@/lib/recovery";
@@ -40,9 +41,17 @@ export async function POST(req: NextRequest) {
       select: { id: true },
     });
 
+    // 다시 시작하면 이전 사건의 진행과 서류는 버린다.
+    // Json 컬럼을 비우려면 undefined(=변경 없음)가 아니라 DbNull을 써야 한다.
     await prisma.recoveryCase.upsert({
       where: { parentId: parent.id },
-      update: { method, incidentAt: when, stepsDone: [], answers: undefined, documents: undefined },
+      update: {
+        method,
+        incidentAt: when,
+        stepsDone: [],
+        answers: Prisma.DbNull,
+        documents: Prisma.DbNull,
+      },
       create: { parentId: parent.id, method, incidentAt: when },
     });
 
