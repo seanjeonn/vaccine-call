@@ -4,6 +4,7 @@ import type { Prisma } from "@prisma/client";
 import { resolveScenario } from "@/lib/scenarios";
 import { prisma } from "@/lib/db";
 import { getSession } from "@/lib/auth";
+import { notifyChild } from "@/lib/notifications";
 import {
   RISK_TAG_CRITERIA,
   RISK_TAG_IDS,
@@ -109,16 +110,13 @@ async function persist(
     });
 
     const risky = report.overallRisk === "high";
-    await prisma.notification.create({
-      data: {
-        childId: parent.childId,
-        reportId: saved.id,
-        type: risky ? "risk" : "report",
-        title: risky
-          ? `${parent.name}님의 훈련에서 위험 신호가 있었어요`
-          : `${parent.name}님이 훈련을 마쳤어요`,
-        body: report.diagnosis.summary,
-      },
+    await notifyChild(parent.childId, {
+      reportId: saved.id,
+      type: risky ? "risk" : "report",
+      title: risky
+        ? `${parent.name}님의 훈련에서 위험 신호가 있었어요`
+        : `${parent.name}님이 훈련을 마쳤어요`,
+      body: report.diagnosis.summary,
     });
 
     return saved.id;

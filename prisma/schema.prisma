@@ -35,6 +35,7 @@ model Parent {
   createdAt    DateTime @default(now())
   reports      Report[]
   recoveryCase RecoveryCase?
+  liveCalls    LiveCall[]
 
   @@index([childId])
 }
@@ -77,12 +78,35 @@ model Session {
   createdAt DateTime @default(now())
 }
 
+// 실시간 통화 세션(F3). 코파일럿이 분석 틱마다 갱신하고 자녀 대시보드가 폴링으로 읽는다.
+// 훈련(Report)과 달리 통화가 끝나기 전에도 행이 존재해야 자녀가 진행 중인 상황을 볼 수 있다.
+model LiveCall {
+  id         String    @id @default(cuid())
+  parentId   String
+  parent     Parent    @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  status     String    @default("active") // "active" | "ended"
+  mode       String    @default("live") // "live"(마이크 청취) | "sim"(체험 모드)
+  stage      String    @default("none") // lib/copilot.ts의 CopilotStage
+  risk       Int       @default(0) // 0~100
+  scamType   String    @default("unknown") // ScenarioId | "unknown"
+  summary    String    @default("") // 자녀에게 보여줄 현재 상황 한 줄
+  transcript Json      @default("[]") // CopilotLine[] — 화자 라벨이 붙은 통화 내용
+  reportId   String? // 통화 종료 후 만들어진 Report
+  alertedAt  DateTime? // 위험 알림은 통화당 1회 — 재발송 가드
+  startedAt  DateTime  @default(now())
+  endedAt    DateTime?
+
+  @@index([parentId, startedAt(sort: Desc)])
+}
+
 // 훈련 리포트. messages는 리포트 화면의 대화 타임라인 렌더에 필요하다.
+// 실제 의심 전화 분석(F3-4)도 같은 표에 남는다 — 포맷이 같아 화면을 그대로 재사용한다.
 model Report {
   id         String   @id @default(cuid())
   parentId   String
   parent     Parent   @relation(fields: [parentId], references: [id], onDelete: Cascade)
   scenarioId String
+  source     String   @default("training") // "training"(모의 훈련) | "live"(실제 의심 전화)
   report     Json // lib/report.ts의 TrainingReport
   messages   Json
   createdAt  DateTime @default(now())
@@ -96,7 +120,7 @@ model Notification {
   childId   String
   child     Child     @relation(fields: [childId], references: [id], onDelete: Cascade)
   reportId  String?
-  type      String // "report" | "risk"
+  type      String // lib/notifications.ts의 NotificationType
   title     String
   body      String
   readAt    DateTime?

@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { getSession } from "@/lib/auth";
+import { notifyChild } from "@/lib/notifications";
 import {
   METHOD_LABELS,
   questionsFor,
@@ -163,16 +164,13 @@ export async function POST(req: NextRequest) {
 
     // 다시 만들 때마다 알리면 자녀에게 같은 알림이 쌓인다. 처음 완성했을 때만 알린다.
     if (!recoveryCase.documents) {
-      await prisma.notification.create({
-        data: {
-          childId: recoveryCase.parent.childId,
-          type: "recovery",
-          title: `${recoveryCase.parent.name}님의 피해구제 서류 초안이 준비됐어요`,
-          body:
-            method === "transfer"
-              ? "인쇄해서 신분증 사본과 함께 은행에 제출해야 합니다. 3영업일 기한을 꼭 확인해 주세요."
-              : "경찰 진술과 은행 제출에 쓸 피해 경위서를 만들었습니다.",
-        },
+      await notifyChild(recoveryCase.parent.childId, {
+        type: "recovery",
+        title: `${recoveryCase.parent.name}님의 피해구제 서류 초안이 준비됐어요`,
+        body:
+          method === "transfer"
+            ? "인쇄해서 신분증 사본과 함께 은행에 제출해야 합니다. 3영업일 기한을 꼭 확인해 주세요."
+            : "경찰 진술과 은행 제출에 쓸 피해 경위서를 만들었습니다.",
       });
     }
 
