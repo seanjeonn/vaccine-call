@@ -297,6 +297,53 @@ export type RecoveryDocuments = {
   narrative: string;
 };
 
+// 사무장에게 무엇을 물어볼지 막막하지 않도록, 지금 단계에 맞는 질문을 미리 띄운다.
+const SUGGESTIONS: Record<StepId, string[]> = {
+  report112: [
+    "112에 전화하면 뭐라고 말해야 하나요?",
+    "지금 신고하면 돈을 돌려받을 수 있나요?",
+  ],
+  giftcardStop: [
+    "상품권으로 보낸 돈도 돌려받을 수 있나요?",
+    "발행사에 전화해서 뭐라고 말해야 하나요?",
+  ],
+  policeDoc: [
+    "경찰서에 무엇을 가지고 가야 하나요?",
+    "사건사고사실확인원이 무엇인가요?",
+  ],
+  documents: [
+    "서류를 왜 3일 안에 내야 하나요?",
+    "은행에 갈 때 무엇을 챙겨야 하나요?",
+  ],
+  msafer: ["엠세이퍼가 무엇인가요?", "개인정보를 알려줬는데 어떻게 해야 하나요?"],
+  accountInfo: ["여신거래 안심차단이 무엇인가요?", "제 다른 계좌도 위험한가요?"],
+};
+
+export type AssistantContext = { greeting: string; suggestions: string[] };
+
+export function assistantContext(
+  method: DamageMethod,
+  stepsDone: string[],
+): AssistantContext {
+  const upcoming = nextStep(method, stepsDone);
+  return {
+    greeting: upcoming
+      ? `무엇이든 물어보세요. 지금은 "${upcoming.title}" 차례예요.`
+      : "필요한 절차는 다 밟으셨어요. 궁금한 점을 물어보세요.",
+    suggestions: [
+      ...(upcoming ? SUGGESTIONS[upcoming.id] : ["돈은 언제쯤 돌려받을 수 있나요?"]),
+      "제가 잘못한 건가요?",
+    ],
+  };
+}
+
+// 사무장 음성. 사기범 배역과 확실히 구분되는 차분한 목소리를 쓴다.
+export const CLERK_VOICE = {
+  voice: "sage",
+  ttsInstructions:
+    "차분하고 따뜻한 40대 상담원 목소리로, 어르신이 알아듣기 쉽게 또박또박 천천히 말하세요.",
+};
+
 // --- 사무장 어시스턴트가 참고하는 절차 지식 ---------------------------------
 
 export const PROCEDURE_KNOWLEDGE = `[신고와 지급정지]

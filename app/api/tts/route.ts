@@ -1,17 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { getScenario } from "@/lib/scenarios";
+import { CLERK_VOICE } from "@/lib/recovery";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-// 텍스트와 시나리오를 받아 배역에 맞는 한국어 TTS 음성(mp3 바이너리)을 반환한다.
+// 텍스트와 배역을 받아 한국어 TTS 음성(mp3 바이너리)을 반환한다.
+// 기본은 훈련 시나리오의 사기범 목소리, persona가 "clerk"이면 피해구제 사무장 목소리다.
 export async function POST(req: NextRequest) {
   try {
     const openai = new OpenAI();
-    const { text, scenario } = (await req.json()) as {
+    const { text, scenario, persona } = (await req.json()) as {
       text: string;
       scenario?: string;
+      persona?: string;
     };
 
     if (!text || typeof text !== "string") {
@@ -21,7 +24,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { voice, ttsInstructions } = getScenario(scenario);
+    const { voice, ttsInstructions } =
+      persona === "clerk" ? CLERK_VOICE : getScenario(scenario);
     const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,
