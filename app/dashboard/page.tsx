@@ -15,6 +15,7 @@ import ParentCard from "@/components/parent-card";
 import ParentTrend, { type TrendRound } from "@/components/parent-trend";
 import NotificationList from "@/components/notification-list";
 import RecoveryStatusCard from "@/components/recovery-status-card";
+import LiveCallWatcher from "@/components/live-call-watcher";
 import type { DamageMethod } from "@/lib/recovery";
 
 export const metadata: Metadata = { title: "보호자 대시보드 · 백신콜" };
@@ -46,6 +47,7 @@ export default async function DashboardPage() {
         id: true,
         parentId: true,
         scenarioId: true,
+        source: true,
         report: true,
         createdAt: true,
         parent: { select: { name: true } },
@@ -96,6 +98,9 @@ export default async function DashboardPage() {
         </div>
         <LogoutButton />
       </header>
+
+      {/* 지금 걸려오고 있는 전화보다 급한 것은 없다 (F3). 통화가 없으면 아무것도 그리지 않는다. */}
+      <LiveCallWatcher />
 
       {/* 피해 구제가 진행 중이면 무엇보다 급한 소식이라 맨 위에 둔다 (F4). */}
       {recoveryCases.length > 0 && (
@@ -193,6 +198,12 @@ export default async function DashboardPage() {
                   >
                     <div>
                       <span className="text-sm font-medium">{row.parent.name}</span>
+                      {/* 훈련과 실제 의심 전화가 같은 목록에 섞인다. 실전은 눈에 띄어야 한다. */}
+                      {row.source === "live" && (
+                        <span className="ml-2 rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] font-medium text-red-300">
+                          실전
+                        </span>
+                      )}
                       <span className="ml-2 text-xs text-neutral-400">
                         {getScenario(row.scenarioId).label}
                       </span>

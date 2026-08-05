@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { getSession } from "@/lib/auth";
+import { notifyChild } from "@/lib/notifications";
 import { isDamageMethod, isStepId, type DamageMethod } from "@/lib/recovery";
 
 export const runtime = "nodejs";
@@ -57,13 +58,10 @@ export async function POST(req: NextRequest) {
 
     // 자녀에게는 시작 시점에 한 번만 알린다. 단계별 진행은 대시보드 카드가 보여준다.
     if (!existing) {
-      await prisma.notification.create({
-        data: {
-          childId: parent.childId,
-          type: "risk",
-          title: `${parent.name}님이 보이스피싱 피해 구제를 시작했어요`,
-          body: "골든타임 절차를 진행 중입니다. 지금 바로 전화해 확인해 주세요.",
-        },
+      await notifyChild(parent.childId, {
+        type: "risk",
+        title: `${parent.name}님이 보이스피싱 피해 구제를 시작했어요`,
+        body: "골든타임 절차를 진행 중입니다. 지금 바로 전화해 확인해 주세요.",
       });
     }
 
