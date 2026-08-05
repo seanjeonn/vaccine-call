@@ -27,12 +27,29 @@ model Parent {
   id        String   @id @default(cuid())
   childId   String
   child     Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
-  name      String // 호칭 ("어머니" 등)
-  ageGroup  String // lib/parent.ts의 AGE_GROUPS
-  createdAt DateTime @default(now())
-  reports   Report[]
+  name         String // 호칭 ("어머니" 등)
+  ageGroup     String // lib/parent.ts의 AGE_GROUPS
+  createdAt    DateTime @default(now())
+  reports      Report[]
+  recoveryCase RecoveryCase?
 
   @@index([childId])
+}
+
+// 피해구제 사건(F4). 부모당 1건만 둔다 — 진행 중인 사건은 하나라는 전제로
+// 모든 화면이 단일 조회로 끝난다. 다시 시작하면 같은 행을 덮어쓴다.
+// answers·documents에는 실명·계좌번호 등 민감정보를 저장하지 않는다 (PRD §5).
+model RecoveryCase {
+  id         String   @id @default(cuid())
+  parentId   String   @unique
+  parent     Parent   @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  method     String // lib/recovery.ts의 DamageMethod — 체크리스트 분기 기준
+  incidentAt DateTime // 피해(송금) 시각. 모든 데드라인이 여기서 계산된다
+  stepsDone  Json     @default("[]") // 완료한 StepId 배열
+  answers    Json? // InterviewAnswers — 서류 문답 결과
+  documents  Json? // RecoveryDocuments — 생성된 서류 초안
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 }
 
 // 부모 초대 토큰. 1회용이며 만료된다. 재발급은 새 행을 만든다.
