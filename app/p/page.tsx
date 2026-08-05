@@ -18,6 +18,7 @@ export default async function ParentHomePage() {
         select: { createdAt: true, report: true },
       },
       _count: { select: { reports: true } },
+      recoveryCase: { select: { id: true } },
     },
   });
 
@@ -50,6 +51,14 @@ export default async function ParentHomePage() {
         className="rounded-full bg-emerald-600 py-8 text-center text-3xl font-bold text-white transition hover:bg-emerald-500"
       >
         훈련 시작하기
+      </Link>
+
+      {/* 피해가 이미 난 사람을 위한 입구(F4). 훈련보다 급한 일이라 항상 보이게 둔다. */}
+      <Link
+        href="/p/recovery"
+        className="rounded-full bg-red-600 py-8 text-center text-3xl font-bold text-white transition hover:bg-red-500"
+      >
+        {parent?.recoveryCase ? "피해 구제 이어서 하기" : "돈을 보내셨나요?"}
       </Link>
 
       {improved && (

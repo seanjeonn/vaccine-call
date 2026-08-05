@@ -129,6 +129,24 @@ const SAFE_REPORT = {
   ],
 };
 
+// 피해구제 데모 사건(F4). 심사위원이 체크리스트 중간 상태와 완성된 서류를 바로 볼 수 있게
+// 어제 발생한 계좌이체 피해로 넣는다. 서류 초안은 실제 생성 결과를 옮겨 적은 고정 문안이다.
+const RECOVERY_ANSWERS = {
+  scamType: "검찰·경찰·금융감독원 같은 기관",
+  amount: "500",
+  myBank: "국민은행",
+  scammerBank: "농협",
+  story:
+    "서울중앙지검 수사관이라면서 제 계좌가 대포통장 사건에 쓰였다고 했어요. 자산을 지켜야 한다면서 안전계좌로 옮기라고 해서 시키는 대로 보냈습니다.",
+};
+
+const RECOVERY_DOCUMENTS = {
+  applicationReason:
+    "본인은 서울중앙지방검찰청 수사관을 사칭한 성명불상자로부터 전화를 받았습니다. 상대방은 본인 명의의 계좌가 대포통장 범죄에 연루되었다고 하며, 자산 보호를 위해 이른바 안전계좌로 자금을 이체해야 한다고 말하였습니다. 본인은 이를 사실로 믿고 국민은행 계좌에서 농협 계좌로 5,000,000원을 이체하였습니다. 이후 가족에게 이야기하면서 전기통신금융사기임을 알게 되었고, 112에 신고하여 지급정지를 요청하였습니다. 위와 같이 전기통신금융사기 피해를 입었으므로 피해구제를 신청합니다.",
+  narrative:
+    "본인은 어제 오전 모르는 번호로 전화를 받았습니다. 상대방은 자신을 서울중앙지방검찰청 수사관이라고 소개하며, 본인 명의의 계좌가 대포통장 사건에 연루되어 조사가 필요하다고 하였습니다.\n\n상대방은 사건번호와 담당 검사의 이름을 말하며 본인을 압박하였고, 이 사실을 가족을 포함한 누구에게도 알리지 말라고 하였습니다. 또한 계좌에 있는 자금이 범죄수익으로 몰수될 수 있으니 국가가 관리하는 안전계좌로 옮겨야 한다고 하였습니다. 본인은 검찰이라는 말에 놀라 상대방의 말을 그대로 믿었습니다.\n\n본인은 상대방이 알려준 농협 계좌로 국민은행 계좌에서 5,000,000원을 이체하였습니다. 이체 직후에도 상대방은 추가 확인이 필요하다며 통화를 계속 이어가려 하였습니다.\n\n통화를 마친 뒤 자녀에게 이 사실을 이야기하던 중 전기통신금융사기임을 알게 되었습니다. 본인은 즉시 112에 신고하여 지급정지를 요청하였고, 송금한 국민은행 고객센터에도 같은 내용을 알렸습니다. 이후 경찰서를 방문하여 정식으로 신고할 예정입니다.",
+};
+
 async function main() {
   const child = await prisma.child.upsert({
     where: { email: DEMO_EMAIL },
@@ -181,8 +199,36 @@ async function main() {
     },
   });
 
+  // 어제 피해가 난 상태. 2단계까지 마쳤고 서류 초안은 이미 만들어 두었다.
+  const incidentAt = daysAgo(1);
+  await prisma.recoveryCase.upsert({
+    where: { parentId: parent.id },
+    update: {
+      method: "transfer",
+      incidentAt,
+      stepsDone: ["report112", "policeDoc"],
+      answers: RECOVERY_ANSWERS,
+      documents: RECOVERY_DOCUMENTS,
+    },
+    create: {
+      parentId: parent.id,
+      method: "transfer",
+      incidentAt,
+      stepsDone: ["report112", "policeDoc"],
+      answers: RECOVERY_ANSWERS,
+      documents: RECOVERY_DOCUMENTS,
+    },
+  });
+
   await prisma.notification.createMany({
     data: [
+      {
+        childId: child.id,
+        type: "risk",
+        title: "어머니님이 보이스피싱 피해 구제를 시작했어요",
+        body: "골든타임 절차를 진행 중입니다. 지금 바로 전화해 확인해 주세요.",
+        createdAt: incidentAt,
+      },
       {
         childId: child.id,
         reportId: safe.id,
@@ -205,6 +251,7 @@ async function main() {
   console.log(`데모 계정 준비 완료: ${DEMO_EMAIL} / ${DEMO_PASSWORD}`);
   console.log(`  부모: ${parent.name} (${parent.ageGroup} · ${parent.bank} · ${parent.family})`);
   console.log(`  리포트: ${await prisma.report.count({ where: { parentId: parent.id } })}건`);
+  console.log("  피해구제: 계좌이체 피해 1건 (2/5단계 완료, 서류 초안 있음)");
 }
 
 main()
