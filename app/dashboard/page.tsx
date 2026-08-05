@@ -14,6 +14,8 @@ import InvitePanel from "@/components/invite-panel";
 import ParentCard from "@/components/parent-card";
 import ParentTrend, { type TrendRound } from "@/components/parent-trend";
 import NotificationList from "@/components/notification-list";
+import RecoveryStatusCard from "@/components/recovery-status-card";
+import type { DamageMethod } from "@/lib/recovery";
 
 export const metadata: Metadata = { title: "보호자 대시보드 · 백신콜" };
 
@@ -23,7 +25,7 @@ const dateTime = (d: Date) =>
 export default async function DashboardPage() {
   const childId = await requireChild();
 
-  const [child, reports, notifications] = await Promise.all([
+  const [child, reports, notifications, recoveryCases] = await Promise.all([
     prisma.child.findUnique({
       where: { id: childId },
       include: {
@@ -54,7 +56,14 @@ export default async function DashboardPage() {
       orderBy: { createdAt: "desc" },
       take: 20,
     }),
+    prisma.recoveryCase.findMany({
+      where: { parent: { childId } },
+      orderBy: { createdAt: "desc" },
+      include: { parent: { select: { name: true } } },
+    }),
   ]);
+
+  const now = new Date();
 
   // 회차 비교는 부모별로 따진다 (F1-5). 시나리오가 달라도 같은 흐름으로 본다.
   const trends = (child?.parents ?? [])
@@ -87,6 +96,26 @@ export default async function DashboardPage() {
         </div>
         <LogoutButton />
       </header>
+
+      {/* 피해 구제가 진행 중이면 무엇보다 급한 소식이라 맨 위에 둔다 (F4). */}
+      {recoveryCases.length > 0 && (
+        <section className="space-y-2">
+          {recoveryCases.map((row) => (
+            <RecoveryStatusCard
+              key={row.id}
+              now={now}
+              summary={{
+                id: row.id,
+                parentName: row.parent.name,
+                method: row.method as DamageMethod,
+                incidentAt: row.incidentAt,
+                stepsDone: (row.stepsDone as string[]) ?? [],
+                hasDocuments: row.documents !== null,
+              }}
+            />
+          ))}
+        </section>
+      )}
 
       <NotificationList
         items={notifications.map((n) => ({
