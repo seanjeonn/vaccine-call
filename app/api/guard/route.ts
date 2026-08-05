@@ -3,7 +3,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
-import { getScenario } from "@/lib/scenarios";
+import { resolveScenario } from "@/lib/scenarios";
 import { RISK_TAG_CRITERIA, RISK_TAG_LABELS, type RiskTagId } from "@/lib/report";
 
 export const runtime = "nodejs";
@@ -35,8 +35,8 @@ const GUARD_SCHEMA = {
   },
 } as const;
 
-function buildSystemPrompt(scenarioId: string | undefined) {
-  const scenario = getScenario(scenarioId);
+function buildSystemPrompt(input: unknown) {
+  const scenario = resolveScenario(input);
   const tagLines = INTERVENE_TAGS.map(
     (id) => `- ${id} (${RISK_TAG_LABELS[id]}): ${RISK_TAG_CRITERIA[id]}`,
   ).join("\n");
@@ -74,7 +74,7 @@ export async function POST(req: NextRequest) {
     const { text, lastAssistant, scenario } = (await req.json()) as {
       text?: string;
       lastAssistant?: string;
-      scenario?: string;
+      scenario?: unknown;
     };
 
     if (typeof text !== "string" || !text.trim()) {

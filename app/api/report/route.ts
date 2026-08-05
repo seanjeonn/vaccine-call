@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import type { Prisma } from "@prisma/client";
-import { getScenario } from "@/lib/scenarios";
+import { resolveScenario } from "@/lib/scenarios";
 import { prisma } from "@/lib/db";
 import { getSession } from "@/lib/auth";
 import {
@@ -57,8 +57,8 @@ const REPORT_SCHEMA = {
   },
 } as const;
 
-function buildSystemPrompt(scenarioId: string | undefined) {
-  const scenario = getScenario(scenarioId);
+function buildSystemPrompt(input: unknown) {
+  const scenario = resolveScenario(input);
   const tagLines = RISK_TAG_IDS.map(
     (id) => `- ${id} (${RISK_TAG_LABELS[id]}): ${RISK_TAG_CRITERIA[id]}`,
   ).join("\n");
@@ -90,7 +90,7 @@ ${tagLines}
 async function persist(
   report: TrainingReport,
   messages: ChatMessage[],
-  scenario: string | undefined,
+  scenario: unknown,
 ): Promise<string | undefined> {
   try {
     const session = await getSession();
@@ -102,7 +102,7 @@ async function persist(
     const saved = await prisma.report.create({
       data: {
         parentId: parent.id,
-        scenarioId: getScenario(scenario).id,
+        scenarioId: resolveScenario(scenario).id,
         report: report as unknown as Prisma.InputJsonValue,
         messages: messages as unknown as Prisma.InputJsonValue,
       },
@@ -142,7 +142,7 @@ export async function POST(req: NextRequest) {
     const openai = new OpenAI();
     const { messages, scenario } = (await req.json()) as {
       messages: ChatMessage[];
-      scenario?: string;
+      scenario?: unknown;
     };
 
     if (!Array.isArray(messages)) {

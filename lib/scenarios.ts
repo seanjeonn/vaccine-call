@@ -81,3 +81,18 @@ ${COMMON_GUIDANCE}`,
 export function getScenario(id: string | undefined | null): Scenario {
   return SCENARIOS.find((s) => s.id === id) ?? SCENARIOS[0];
 }
+
+export function randomScenario(): Scenario {
+  return SCENARIOS[Math.floor(Math.random() * SCENARIOS.length)];
+}
+
+// 라우트가 받는 scenario 필드. 맞춤 생성 시나리오(F1-1)는 서버가 id로 조회할 수 없어
+// 클라이언트가 객체째 실어 보낸다. 예전처럼 id 문자열만 와도 그대로 받아준다.
+// 빠진 필드는 기본 시나리오가 메우고 id는 3종으로 강제해, 잘못된 값이 와도 정적 시나리오로 수렴한다.
+export function resolveScenario(input: unknown): Scenario {
+  if (input && typeof input === "object") {
+    const base = getScenario((input as Partial<Scenario>).id);
+    return { ...base, ...(input as Partial<Scenario>), id: base.id };
+  }
+  return getScenario(typeof input === "string" ? input : undefined);
+}
