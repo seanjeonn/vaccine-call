@@ -14,6 +14,7 @@ import {
   CHUNK_MS,
   COPILOT_CARDS,
   COPILOT_STAGES,
+  SIM_SCRIPT,
   STAGE_LABELS,
   riskLevel,
   stageRank,
@@ -21,11 +22,15 @@ import {
   type CopilotLine,
   type CopilotScamType,
   type CopilotStage,
+  type SimLine,
 } from "@/lib/copilot";
 
-type Status = "idle" | "connecting" | "listening";
+type Status = "idle" | "connecting" | "listening" | "simulating";
+type Mode = "live" | "sim";
 
 type AnalysisResponse = CopilotAnalysis & { alerted: boolean };
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // 마이크 소리 크기 표본 주기와 발화 판정 임계값. 훈련 화면의 VAD와 같은 값을 쓰되,
 // 여기서는 턴을 끊는 데 쓰지 않고 "이 조각에 말소리가 있었나"만 본다.
@@ -51,6 +56,8 @@ const RISK_LABELS = { low: "낮음", medium: "주의", high: "높음" } as const
 
 export default function CopilotClient() {
   const [status, setStatus] = useState<Status>("idle");
+  const [mode, setMode] = useState<Mode>("live");
+  const [simDone, setSimDone] = useState(false);
   const [lines, setLines] = useState<CopilotLine[]>([]);
   const [stage, setStage] = useState<CopilotStage>("none");
   const [risk, setRisk] = useState(0);
@@ -181,9 +188,12 @@ export default function CopilotClient() {
     [playBlob, stopRecorder],
   );
 
+  // 화면 상태를 갱신하고, 단계가 올라갔으면 그 단계를 돌려준다.
+  // 안내 음성을 여기서 바로 틀지 않는 것은 체험 모드 때문이다. 체험 모드는 대본 음성과
+  // 안내 음성이 같은 스피커를 쓰므로 호출한 쪽이 순서를 정해야 한다.
   const applyAnalysis = useCallback(
-    (data: AnalysisResponse) => {
-      if (data.lines.length > 0) {
+    (data: AnalysisResponse, appendLines: boolean): CopilotStage | null => {
+      if (appendLines && data.lines.length > 0) {
         const next = [...linesRef.current, ...data.lines];
         linesRef.current = next;
         setLines(next);
@@ -195,32 +205,35 @@ export default function CopilotClient() {
 
       const escalated = stageRank(data.stage) > stageRank(stageRef.current);
       stageRef.current = data.stage;
-      if (escalated) {
-        // 화면을 못 보고 있을 수 있다. 진동은 스피커폰 옆에서도 조용하다.
-        navigator.vibrate?.([200, 100, 200]);
-        if (voiceOnRef.current) void speakGuidance(data.stage);
-      }
+      if (!escalated) return null;
+      // 화면을 못 보고 있을 수 있다. 진동은 스피커폰 옆에서도 조용하다.
+      navigator.vibrate?.([200, 100, 200]);
+      return data.stage;
     },
-    [speakGuidance],
+    [],
   );
 
   // 분석 실패는 통화를 방해하면 안 되므로 조용히 삼킨다. 다음 조각에서 다시 판정된다.
   const analyze = useCallback(
-    async (payload: { newText?: string; newLines?: CopilotLine[] }) => {
+    async (
+      payload: { newText?: string; newLines?: CopilotLine[] },
+      appendLines = true,
+    ): Promise<CopilotStage | null> => {
       const callId = callIdRef.current;
-      if (!callId) return;
+      if (!callId) return null;
       try {
         const res = await fetch("/api/copilot", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ callId, ...payload }),
         });
-        if (!res.ok) return;
+        if (!res.ok) return null;
         const data = (await res.json()) as AnalysisResponse;
-        if (!callActiveRef.current) return;
-        applyAnalysis(data);
+        if (!callActiveRef.current) return null;
+        return applyAnalysis(data, appendLines);
       } catch (err) {
         console.error("[copilot] 분석 실패", err);
+        return null;
       }
     },
     [applyAnalysis],
@@ -234,12 +247,14 @@ export default function CopilotClient() {
       while (callActiveRef.current && pendingTextRef.current.trim()) {
         const text = pendingTextRef.current.trim();
         pendingTextRef.current = "";
-        await analyze({ newText: text });
+        const escalated = await analyze({ newText: text });
+        // 안내는 기다리지 않는다. 통화는 계속 흐르므로 다음 조각을 놓치면 안 된다.
+        if (escalated && voiceOnRef.current) void speakGuidance(escalated);
       }
     } finally {
       analyzingRef.current = false;
     }
-  }, [analyze]);
+  }, [analyze, speakGuidance]);
 
   const transcribeChunk = useCallback(
     async (blob: Blob) => {
@@ -301,26 +316,113 @@ export default function CopilotClient() {
     setRisk(0);
     setScamType("unknown");
     setAlerted(false);
+    setSimDone(false);
     setError(null);
   }, []);
 
+  // 통화 세션을 열고 callId를 잡는다. 실전·체험 모드가 같은 파이프라인을 쓴다.
+  const openCall = useCallback(async (which: Mode) => {
+    const res = await fetch("/api/copilot/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: which }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error(body?.error ?? "통화를 시작하지 못했습니다.");
+    }
+    const { callId } = (await res.json()) as { callId: string };
+    callIdRef.current = callId;
+  }, []);
+
+  const synthesizeSimLine = useCallback(async (line: SimLine) => {
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        line.speaker === "caller"
+          ? { text: line.text, scenario: "institution" }
+          : { text: line.text, persona: "victim" },
+      ),
+    });
+    if (!res.ok) throw new Error("TTS 실패");
+    return res.blob();
+  }, []);
+
+  // 체험 모드(F3 시연). 마이크를 쓰지 않고 대본을 두 목소리로 들려주면서
+  // 같은 분석 파이프라인에 밀어 넣는다. 대본이라 화자가 확정되어 STT를 건너뛴다.
+  const runSim = useCallback(async () => {
+    // 다음 대사는 지금 대사가 나가는 동안 미리 합성한다.
+    let upcoming = synthesizeSimLine(SIM_SCRIPT[0]);
+    upcoming.catch(() => {}); // 실패는 재생 시점에 받는다. 여기서는 unhandled만 막는다
+
+    for (let i = 0; i < SIM_SCRIPT.length; i++) {
+      if (!callActiveRef.current) return;
+      const line = SIM_SCRIPT[i];
+      const current = upcoming;
+      const nextLine = SIM_SCRIPT[i + 1];
+      if (nextLine) {
+        upcoming = synthesizeSimLine(nextLine);
+        upcoming.catch(() => {});
+      }
+
+      // 자막은 음성이 나가는 시점에 맞춘다. 분석 응답을 기다리면 한 박자 늦다.
+      const next = [...linesRef.current, { speaker: line.speaker, text: line.text }];
+      linesRef.current = next;
+      setLines(next);
+
+      try {
+        const blob = await current;
+        if (!callActiveRef.current) return;
+        await playBlob(blob);
+      } catch (err) {
+        console.error("[copilot] 체험 음성 실패", err);
+      }
+      if (!callActiveRef.current) return;
+
+      const escalated = await analyze(
+        { newLines: [{ speaker: line.speaker, text: line.text }] },
+        false, // 자막은 위에서 이미 붙였다
+      );
+      if (!callActiveRef.current) return;
+      // 실전과 달리 안내를 끝까지 기다린다. 대본 음성과 스피커가 겹치면 안 된다.
+      if (escalated && voiceOnRef.current) await speakGuidance(escalated);
+      if (!callActiveRef.current) return;
+      await wait(line.pauseMs);
+    }
+
+    if (callActiveRef.current) setSimDone(true);
+  }, [analyze, playBlob, speakGuidance, synthesizeSimLine]);
+
+  const startSim = useCallback(async () => {
+    resetState();
+    setMode("sim");
+    setStatus("connecting");
+    callActiveRef.current = true;
+    // 체험 모드에는 옆에서 들을 사기꾼이 없다. 안내 음성이 있어야 시연이 산다.
+    setVoiceOn(true);
+    voiceOnRef.current = true;
+
+    try {
+      await openCall("sim");
+      if (!callActiveRef.current) return;
+      setStatus("simulating");
+      await runSim();
+    } catch (err) {
+      teardown();
+      setStatus("idle");
+      setError(err instanceof Error ? err.message : "체험을 시작할 수 없습니다.");
+    }
+  }, [openCall, resetState, runSim, teardown]);
+
   const startCall = useCallback(async () => {
     resetState();
+    setMode("live");
     setStatus("connecting");
     callActiveRef.current = true;
 
     try {
-      const res = await fetch("/api/copilot/call", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "live" }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => null);
-        throw new Error(body?.error ?? "통화를 시작하지 못했습니다.");
-      }
-      const { callId } = (await res.json()) as { callId: string };
-      callIdRef.current = callId;
+      await openCall("live");
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (!callActiveRef.current) {
@@ -368,7 +470,7 @@ export default function CopilotClient() {
             : "통화 분석을 시작할 수 없습니다.",
       );
     }
-  }, [resetState, teardown]);
+  }, [openCall, resetState, teardown]);
 
   const endCall = useCallback(() => {
     const callId = callIdRef.current;
@@ -430,6 +532,17 @@ export default function CopilotClient() {
           분석하는 동안 상대방에게는 아무 소리도 들리지 않습니다.
         </p>
 
+        {/* 실제 사기 전화를 기다릴 수 없으니, 가짜 통화로 기능을 보여주는 입구를 둔다. */}
+        <button
+          onClick={() => void startSim()}
+          className="rounded-2xl border border-neutral-700 px-5 py-4 text-center text-xl font-medium text-neutral-300 transition hover:border-neutral-500"
+        >
+          체험 모드로 보기
+          <span className="mt-1 block text-base font-normal text-neutral-500">
+            마이크 없이 가짜 사기 전화를 들려드려요
+          </span>
+        </button>
+
         <Link href="/p" className="text-center text-lg text-neutral-400 underline">
           홈으로 돌아가기
         </Link>
@@ -443,7 +556,11 @@ export default function CopilotClient() {
         <div className="flex items-center gap-2">
           <span className="h-3 w-3 animate-pulse rounded-full bg-red-500" />
           <span className="text-lg font-semibold">
-            {status === "connecting" ? "준비 중…" : "통화를 듣고 있어요"}
+            {status === "connecting"
+              ? "준비 중…"
+              : mode === "sim"
+                ? "가짜 전화를 듣고 있어요"
+                : "통화를 듣고 있어요"}
           </span>
         </div>
         <button
@@ -458,6 +575,13 @@ export default function CopilotClient() {
           {voiceOn ? "음성 안내 켬" : "음성 안내 끔"}
         </button>
       </header>
+
+      {/* 체험 모드는 실제 전화로 오해받으면 안 된다 (PRD §5 안전장치). */}
+      {mode === "sim" && (
+        <p className="rounded-lg bg-amber-500/15 px-4 py-2 text-center text-base font-medium text-amber-300">
+          ⚠️ 체험 모드입니다. 실제 전화가 아닙니다.
+        </p>
+      )}
 
       {/* 위험도 게이지 */}
       <section>
@@ -543,11 +667,16 @@ export default function CopilotClient() {
       )}
 
       <div className="mt-auto pt-4">
+        {simDone && (
+          <p className="mb-3 text-center text-lg leading-relaxed text-neutral-400">
+            체험이 끝났어요. 아래 버튼을 눌러 마무리하세요.
+          </p>
+        )}
         <button
           onClick={endCall}
           className="w-full rounded-full bg-red-600 py-8 text-center text-3xl font-bold text-white transition hover:bg-red-500"
         >
-          통화 종료
+          {mode === "sim" ? "체험 끝내기" : "통화 종료"}
         </button>
       </div>
 
