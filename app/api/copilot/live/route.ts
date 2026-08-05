@@ -11,6 +11,11 @@ export const runtime = "nodejs";
 // 무슨 일이 있었는지는 알아야 한다.
 const RECENT_MS = 30 * 60 * 1000;
 
+// 부모가 통화 도중 브라우저를 닫으면 종료 신호가 오지 않는다. 그대로 두면 자녀 화면에
+// "지금 전화를 받고 있어요"가 영원히 걸린 채로 남는다. 분석 틱이 5초마다 도는 것을
+// 이용해, 이만큼 갱신이 없으면 끊긴 통화로 본다.
+const STALE_MS = 3 * 60 * 1000;
+
 export async function GET() {
   try {
     const session = await getSession();
@@ -18,12 +23,13 @@ export async function GET() {
       return NextResponse.json({ error: "로그인이 필요합니다." }, { status: 401 });
     }
 
+    const now = Date.now();
     const calls = await prisma.liveCall.findMany({
       where: {
         parent: { childId: session.childId },
         OR: [
-          { status: "active" },
-          { endedAt: { gte: new Date(Date.now() - RECENT_MS) } },
+          { status: "active", updatedAt: { gte: new Date(now - STALE_MS) } },
+          { endedAt: { gte: new Date(now - RECENT_MS) } },
         ],
       },
       orderBy: { startedAt: "desc" },

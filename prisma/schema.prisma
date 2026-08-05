@@ -94,6 +94,9 @@ model LiveCall {
   reportId   String? // 통화 종료 후 만들어진 Report
   alertedAt  DateTime? // 위험 알림은 통화당 1회 — 재발송 가드
   startedAt  DateTime  @default(now())
+  // 분석 틱마다 갱신된다. 부모가 통화 도중 브라우저를 닫으면 종료 신호가 오지 않으므로,
+  // 자녀 화면은 이 시각을 보고 "아직 통화 중"인지 판단한다.
+  updatedAt  DateTime  @updatedAt
   endedAt    DateTime?
 
   @@index([parentId, startedAt(sort: Desc)])
