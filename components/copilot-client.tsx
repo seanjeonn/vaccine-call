@@ -10,7 +10,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { getScenario } from "@/lib/scenarios";
+import type { TrainingReport } from "@/lib/report";
+import TrainingReportView from "@/components/training-report";
 import {
+  ALERT_RISK_THRESHOLD,
   CHUNK_MS,
   COPILOT_CARDS,
   COPILOT_STAGES,
@@ -27,6 +30,8 @@ import {
 
 type Status = "idle" | "connecting" | "listening" | "simulating";
 type Mode = "live" | "sim";
+// 리포트는 통화 상태와 별개로 흐른다. (통화가 끝난 뒤 idle 상태에서 표시)
+type ReportPhase = "none" | "loading" | "ready" | "error";
 
 type AnalysisResponse = CopilotAnalysis & { alerted: boolean };
 
@@ -65,6 +70,13 @@ export default function CopilotClient() {
   const [alerted, setAlerted] = useState(false);
   const [voiceOn, setVoiceOn] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const [reportPhase, setReportPhase] = useState<ReportPhase>("none");
+  const [report, setReport] = useState<TrainingReport | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [reportShared, setReportShared] = useState(false);
+  // 통화 중 가장 높았던 위험도. 마지막 판정만 보면 상대가 물러난 뒤의 값이 남는다.
+  const [peakRisk, setPeakRisk] = useState(0);
 
   const callActiveRef = useRef(false);
   const callIdRef = useRef<string | null>(null);
@@ -202,6 +214,7 @@ export default function CopilotClient() {
       setStage(data.stage);
       setScamType(data.scamType);
       if (data.alerted) setAlerted(true);
+      setPeakRisk((prev) => Math.max(prev, data.risk));
 
       const escalated = stageRank(data.stage) > stageRank(stageRef.current);
       stageRef.current = data.stage;
@@ -311,6 +324,11 @@ export default function CopilotClient() {
     linesRef.current = [];
     stageRef.current = "none";
     pendingTextRef.current = "";
+    setPeakRisk(0);
+    setReportPhase("none");
+    setReport(null);
+    setReportError(null);
+    setReportShared(false);
     setLines([]);
     setStage("none");
     setRisk(0);
@@ -472,8 +490,54 @@ export default function CopilotClient() {
     }
   }, [openCall, resetState, teardown]);
 
+  // 통화가 끝나면 훈련과 같은 포맷으로 분석 리포트를 만든다 (F3-4).
+  // 화자 라벨을 훈련 리포트의 역할로 옮기면 리포트 화면과 저장 형식을 그대로 쓸 수 있다.
+  const generateReport = useCallback(
+    async (transcript: CopilotLine[], type: CopilotScamType, callId: string | null) => {
+      const messages = transcript.map((line) => ({
+        role: line.speaker === "caller" ? ("assistant" as const) : ("user" as const),
+        content: line.text,
+      }));
+
+      // 어르신이 한마디도 하지 않은 통화는 분석할 것이 없다.
+      if (!messages.some((m) => m.role === "user")) {
+        setReportPhase("ready");
+        return;
+      }
+
+      setReportPhase("loading");
+      try {
+        const res = await fetch("/api/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages, live: { scamType: type } }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "리포트를 만들지 못했습니다.");
+        setReport(data.report as TrainingReport);
+        setReportShared(Boolean(data.reportId));
+        setReportPhase("ready");
+
+        // 자녀 화면에서 통화 카드가 리포트로 이어지도록 id를 붙여둔다.
+        if (callId && data.reportId) {
+          void fetch("/api/copilot/call", {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ callId, reportId: data.reportId }),
+          }).catch(() => {});
+        }
+      } catch (err) {
+        setReportError(err instanceof Error ? err.message : "리포트를 만들지 못했습니다.");
+        setReportPhase("error");
+      }
+    },
+    [],
+  );
+
   const endCall = useCallback(() => {
     const callId = callIdRef.current;
+    const transcript = linesRef.current;
+    const type = scamType;
     teardown();
     setStatus("idle");
     if (callId) {
@@ -483,7 +547,14 @@ export default function CopilotClient() {
         body: JSON.stringify({ callId }),
       }).catch(() => {});
     }
-  }, [teardown]);
+    void generateReport(transcript, type, callId);
+  }, [generateReport, scamType, teardown]);
+
+  const restart = useCallback(() => {
+    callIdRef.current = null;
+    resetState();
+    setStatus("idle");
+  }, [resetState]);
 
   useEffect(() => {
     return () => {
@@ -499,6 +570,87 @@ export default function CopilotClient() {
   const card = COPILOT_CARDS[stage];
   const inCall = status !== "idle";
   const recentLines = lines.slice(-3);
+  const showingReport = !inCall && reportPhase !== "none";
+
+  if (showingReport) {
+    // 실제로 돈이 나갔는지는 알 수 없다. 위험했던 통화라면 피해구제 입구(F4)를 크게 연다.
+    const risky =
+      report?.overallRisk === "high" || peakRisk >= ALERT_RISK_THRESHOLD;
+    const typeLabel =
+      scamType === "unknown" ? "수법 미상" : getScenario(scamType).label;
+
+    return (
+      <main className="mx-auto flex min-h-screen w-full max-w-md flex-col gap-5 px-5 py-8">
+        <header>
+          <h1 className="text-2xl font-bold">통화가 끝났어요</h1>
+          <p className="mt-2 text-lg leading-relaxed text-neutral-400">
+            방금 통화에서 위험했던 순간을 살펴봤어요.
+          </p>
+        </header>
+
+        {reportPhase === "loading" && (
+          <div className="flex flex-col items-center gap-3 py-12">
+            <span className="animate-pulse text-4xl">📋</span>
+            <p className="text-lg text-neutral-300">분석하고 있어요…</p>
+          </div>
+        )}
+
+        {reportPhase === "error" && (
+          <div className="rounded-lg bg-red-500/15 px-4 py-4 text-red-300">
+            <p className="text-lg">분석을 마치지 못했어요.</p>
+            {reportError && <p className="mt-1 text-sm text-red-400/80">{reportError}</p>}
+          </div>
+        )}
+
+        {reportPhase === "ready" && report && (
+          <>
+            {reportShared && (
+              <p className="rounded-lg bg-emerald-500/15 px-4 py-3 text-lg text-emerald-300">
+                이 결과가 자녀분께 전달되었어요.
+              </p>
+            )}
+            <div className="rounded-2xl bg-neutral-900/60">
+              <TrainingReportView
+                report={report}
+                messages={lines.map((line) => ({
+                  role: line.speaker === "caller" ? "assistant" : "user",
+                  content: line.text,
+                }))}
+                title="통화 분석 리포트"
+                subtitle={`${typeLabel} · 실제 통화`}
+              />
+            </div>
+          </>
+        )}
+
+        {reportPhase === "ready" && !report && (
+          <p className="rounded-lg border border-neutral-800 px-4 py-8 text-center text-lg text-neutral-400">
+            통화 내용이 짧아 분석할 것이 없었어요.
+          </p>
+        )}
+
+        {risky && (
+          <Link
+            href="/p/recovery"
+            className="rounded-full bg-red-600 py-8 text-center text-3xl font-bold text-white transition hover:bg-red-500"
+          >
+            돈을 보내셨나요?
+          </Link>
+        )}
+
+        <button
+          onClick={restart}
+          className="rounded-full border border-neutral-700 py-5 text-center text-xl font-medium text-neutral-300 transition hover:border-neutral-500"
+        >
+          다시 분석하기
+        </button>
+
+        <Link href="/p" className="text-center text-lg text-neutral-400 underline">
+          홈으로 돌아가기
+        </Link>
+      </main>
+    );
+  }
 
   if (!inCall) {
     return (
