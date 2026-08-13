@@ -49,3 +49,7 @@ next-env.d.ts
 skills-lock.json
 .claude/skills/neon
 .claude/skills/neon-postgres
+
+# eval harness
+eval-runs/
+.eval-cache/

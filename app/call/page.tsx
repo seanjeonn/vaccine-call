@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { randomScenario, type Scenario } from "@/lib/scenarios";
+import { openingResponseInstructions } from "@/lib/realtime-session";
 import type { TrainingReport } from "@/lib/report";
 import TrainingReportView from "@/components/training-report";
 import InterventionScreen, { type Interruption } from "@/components/intervention-screen";
@@ -434,7 +435,7 @@ export default function Home() {
           JSON.stringify({
             type: "response.create",
             response: {
-              instructions: `통화가 방금 연결되었습니다. 다음 오프닝 대사를 그대로 말하세요: "${picked.opening}"`,
+              instructions: openingResponseInstructions(picked),
             },
           }),
         );
