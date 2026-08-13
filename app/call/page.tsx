@@ -8,54 +8,27 @@ import InterventionScreen, { type Interruption } from "@/components/intervention
 
 type Role = "user" | "assistant";
 type Message = { role: Role; content: string };
-type Latency = {
-  turn: number;
-  stt: number | null;
-  llm: number;
-  tts: number;
-  total: number;
-};
-type Status = "idle" | "connecting" | "speaking" | "listening" | "processing";
+// Realtime 대화 항목. 도착 순서(= 실제 대화 순서)를 item_id 단위로 붙잡아 둔다.
+// 사용자 발화의 전사는 사기꾼 응답이 시작된 뒤에 완료되는 것이 보통이라, 완료 순서대로
+// 쌓으면 대화가 뒤집힌다. 리포트의 턴 인용(turnIndex)이 어긋나지 않으려면 순서가 중요하다.
+type Entry = { id: string; role: Role; content: string };
+type Status = "idle" | "connecting" | "speaking" | "listening";
 // 리포트는 통화 상태와 별개로 흐른다. (통화 종료 후 idle 상태에서만 표시)
 type ReportPhase = "none" | "loading" | "ready" | "error";
 
-const round = (ms: number) => Math.round(ms);
-
-// 턴별 지연 패널은 개발 중에만 띄운다. (부모가 보는 화면에 필요 없는 정보)
-const SHOW_LATENCY_PANEL = process.env.NODE_ENV === "development";
-
-// 스트리밍 버퍼에서 완성된 문장만 잘라낸다. 완성분은 곧바로 TTS로 넘기고 나머지는 다음 청크와 이어 붙인다.
-function takeSentences(buffer: string): { sentences: string[]; rest: string } {
-  const sentences: string[] = [];
-  let start = 0;
-  for (let i = 0; i < buffer.length; i++) {
-    if (!".?!…".includes(buffer[i])) continue;
-    // 3.5처럼 숫자 사이의 마침표는 문장 끝이 아니다.
-    if (
-      buffer[i] === "." &&
-      /\d/.test(buffer[i - 1] ?? "") &&
-      /\d/.test(buffer[i + 1] ?? "")
-    ) {
-      continue;
-    }
-    const piece = buffer.slice(start, i + 1).trim();
-    if (piece) sentences.push(piece);
-    start = i + 1;
-  }
-  return { sentences, rest: buffer.slice(start) };
-}
-
-// --- VAD 튜닝 상수 (데스크톱 Chrome 기준 시작값) ---
-const VAD_INTERVAL_MS = 50; // RMS 샘플링 주기
-const VAD_RMS_THRESHOLD = 0.02; // 발화 판정 임계값 (환경 따라 0.01~0.05)
-const VAD_MIN_SPEECH_MS = 300; // 이만큼 누적 발화해야 "말했다" 인정 (기침·잡음 방지)
-const VAD_SILENCE_MS = 1500; // 발화 후 이 시간 침묵이면 턴 종료
-const VAD_MAX_UTTERANCE_MS = 30000; // 최대 발화 안전장치
+// 데이터 채널로 오는 서버 이벤트 중 이 화면이 쓰는 필드만 추린 형태.
+type ServerEvent = {
+  type?: string;
+  item?: { id?: string; type?: string; role?: string };
+  item_id?: string;
+  transcript?: string;
+  delta?: string;
+  error?: unknown;
+};
 
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [messages, setMessages] = useState<Message[]>([]);
-  const [latencies, setLatencies] = useState<Latency[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [scenario, setScenario] = useState<Scenario | null>(null);
   const scenarioRef = useRef<Scenario | null>(null);
@@ -70,30 +43,49 @@ export default function Home() {
   // 훈련 중 개입(F1-4). 값이 있으면 통화를 멈추고 정지 화면을 띄운다.
   const [interruption, setInterruption] = useState<Interruption | null>(null);
 
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
 
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const vadTimerRef = useRef<number | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null); // 연결음 전용
   const callActiveRef = useRef(false);
+  const entriesRef = useRef<Entry[]>([]);
   const messagesRef = useRef<Message[]>([]);
   const ringbackRef = useRef<{ stop: () => void } | null>(null);
-
-  // 상호 재귀 함수들의 stale 참조를 피하기 위한 간접 참조.
-  const startListeningRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
-  const setConversation = useCallback((next: Message[]) => {
+  // 대화 항목을 화면·리포트용 Message[]로 접는다. 전사가 아직 안 온 항목은 비운 채 두고
+  // 여기서 걸러낸다. (통화를 끊는 순간 전사 중이던 발화가 빠지는 것은 기존 동작과 같다)
+  const syncTranscript = useCallback(() => {
+    const next = entriesRef.current
+      .map((e) => ({ role: e.role, content: e.content.trim() }))
+      .filter((m) => m.content.length > 0);
     messagesRef.current = next;
     setMessages(next);
   }, []);
+
+  const upsertEntry = useCallback((id: string, role: Role) => {
+    if (entriesRef.current.some((e) => e.id === id)) return;
+    entriesRef.current.push({ id, role, content: "" });
+  }, []);
+
+  // 항목에 전사를 채운다. 항목 생성 이벤트보다 전사가 먼저 와도 대사를 잃지 않는다.
+  const writeEntry = useCallback(
+    (id: string, role: Role, text: string, mode: "set" | "append") => {
+      const found = entriesRef.current.find((e) => e.id === id);
+      if (!found) {
+        entriesRef.current.push({ id, role, content: text });
+        return;
+      }
+      found.content = mode === "append" ? found.content + text : text;
+    },
+    [],
+  );
 
   // 진행 중인 리포트 요청을 취소하고 리포트 화면을 걷어낸다. (새 통화·초기화 공통)
   const clearReport = useCallback(() => {
@@ -151,31 +143,21 @@ export default function Home() {
 
   // 통화 관련 리소스를 모두 해제한다. (통화 종료·오류 공통)
   const teardown = useCallback(() => {
+    // 연결을 끊기 전에 내려야 onclose·connectionstatechange 핸들러가 endCall을 다시 부르지 않는다.
     callActiveRef.current = false;
     ringbackRef.current?.stop();
-    if (vadTimerRef.current !== null) {
-      clearInterval(vadTimerRef.current);
-      vadTimerRef.current = null;
-    }
-    const rec = recorderRef.current;
-    if (rec) {
-      rec.onstop = null; // runTurn 트리거 방지
-      try {
-        if (rec.state !== "inactive") rec.stop();
-      } catch {
-        // ignore
-      }
-    }
-    recorderRef.current = null;
+    dcRef.current?.close();
+    dcRef.current = null;
+    pcRef.current?.close();
+    pcRef.current = null;
     if (audioRef.current) {
       audioRef.current.pause();
-      audioRef.current.onended = null;
+      audioRef.current.srcObject = null;
     }
     if (audioCtxRef.current) {
       audioCtxRef.current.close().catch(() => {});
       audioCtxRef.current = null;
     }
-    analyserRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     // 시나리오는 남겨둔다. 통화 종료 후 리포트 화면이 어떤 훈련이었는지 표시해야 한다.
@@ -222,11 +204,15 @@ export default function Home() {
   // 사용자 발화 한 턴이 결정적 위험인지 판정한다. 사기꾼 응답과 병렬로 돈다.
   // 판정 실패는 훈련을 방해하면 안 되므로 전부 조용히 삼킨다.
   const checkGuard = useCallback(
-    async (utterance: string, history: Message[]) => {
+    async (utterance: string, itemId: string) => {
       try {
-        const lastAssistant = [...history]
+        // 이 발화 "직전"의 사기꾼 대사를 찾는다. 판정 시점에는 다음 응답이 이미
+        // 흐르고 있을 수 있어, 항목 순서를 기준으로 앞쪽만 본다.
+        const at = entriesRef.current.findIndex((e) => e.id === itemId);
+        const before = at === -1 ? entriesRef.current : entriesRef.current.slice(0, at);
+        const lastAssistant = [...before]
           .reverse()
-          .find((m) => m.role === "assistant")?.content;
+          .find((e) => e.role === "assistant")?.content;
         const res = await fetch("/api/guard", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -251,7 +237,7 @@ export default function Home() {
     [interruptCall],
   );
 
-  // 통화 연결음(ringback)을 오실레이터로 합성해 즉시 울린다. 오프닝 대기 체감을 줄인다.
+  // 통화 연결음(ringback)을 오실레이터로 합성해 즉시 울린다. 세션 발급·연결 대기 체감을 줄인다.
   const startRingback = useCallback((ctx: AudioContext) => {
     const gain = ctx.createGain();
     gain.gain.value = 0;
@@ -288,292 +274,88 @@ export default function Home() {
     };
   }, []);
 
-  // 문장 하나를 TTS로 합성해 오디오 Blob을 받는다.
-  const synthesize = useCallback(async (text: string) => {
-    const res = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, scenario: scenarioRef.current }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => null);
-      throw new Error(body?.error ?? `TTS 실패 (${res.status})`);
-    }
-    return res.blob();
+  // 사기꾼이 말하기 시작하는 순간. 연결음을 끊고 통화 화면으로 넘긴다.
+  const startSpeaking = useCallback(() => {
+    ringbackRef.current?.stop();
+    if (callActiveRef.current) setStatus("speaking");
   }, []);
 
-  // 오디오 한 조각을 재생하고 끝날 때까지 기다린다. onStart는 소리가 실제로 나오는 순간
-  // 호출되며, 자막을 그 시점에 맞추는 데 쓴다.
-  const playBlob = useCallback((blob: Blob, onStart: () => void) => {
-    return new Promise<void>((resolve) => {
-      const audioEl = audioRef.current;
-      const url = URL.createObjectURL(blob);
-      let done = false;
-      const finish = () => {
-        if (done) return;
-        done = true;
-        URL.revokeObjectURL(url);
-        resolve();
-      };
-      if (!audioEl) {
-        onStart();
-        finish();
-        return;
-      }
-      audioEl.src = url;
-      audioEl.onplay = () => {
-        onStart();
-        // 재생이 시작된 뒤에만 pause를 종료 신호로 본다. (통화 종료로 멈춘 경우 대기 해제)
-        audioEl.onpause = finish;
-      };
-      audioEl.onended = finish;
-      audioEl.play().catch(() => {
-        // 재생이 막히면 onplay가 오지 않는다. 최소한 대사는 읽을 수 있게 띄운다.
-        onStart();
-        finish();
-      });
-    });
-  }, []);
-
-  // 준비된 대사 한 줄을 합성·재생한다. (오프닝처럼 LLM을 거치지 않는 고정 대사용)
-  const speakLine = useCallback(
-    async (text: string, nextConversation: Message[], t0: number) => {
-      const blob = await synthesize(text);
-      if (!callActiveRef.current) return;
-      const tAudio = performance.now();
-      setLatencies((prev) => [
-        ...prev,
-        { turn: prev.length + 1, stt: null, llm: 0, tts: tAudio - t0, total: tAudio - t0 },
-      ]);
-      ringbackRef.current?.stop(); // 연결음 정지 후 대사 재생
-      setStatus("speaking");
-      await playBlob(blob, () => setConversation(nextConversation));
-      if (callActiveRef.current) startListeningRef.current();
-    },
-    [synthesize, playBlob, setConversation],
-  );
-
-  // LLM 응답을 스트리밍으로 받아, 문장이 완성될 때마다 TTS를 먼저 태우고 순서대로 재생한다.
-  // 전체 응답을 기다렸다가 한 번에 합성하면 첫 소리까지 LLM 전체 + TTS 전체 시간이 걸린다.
-  // t0: 턴 시작, sttMs: STT 소요.
-  const assistantRespond = useCallback(
-    async (history: Message[], t0: number, sttMs: number | null) => {
-      const chatRes = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history, scenario: scenarioRef.current }),
-      });
-      if (!chatRes.ok || !chatRes.body) {
-        const body = await chatRes.json().catch(() => null);
-        throw new Error(body?.error ?? `LLM 실패 (${chatRes.status})`);
-      }
-
-      type Segment = { text: string; audio: Promise<Blob> };
-      const segments: Segment[] = [];
-      let streamDone = false;
-      let firstSentenceAt: number | null = null;
-      // 새 문장이 준비되면 재생 루프를 깨우는 신호.
-      const waiter: { wake: (() => void) | null } = { wake: null };
-      const pushSegment = (text: string) => {
-        if (firstSentenceAt === null) firstSentenceAt = performance.now();
-        segments.push({ text, audio: synthesize(text) });
-        waiter.wake?.();
-      };
-
-      const pump = (async () => {
-        const reader = chatRes.body!.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!callActiveRef.current) return;
-            buffer += decoder.decode(value, { stream: true });
-            const { sentences, rest } = takeSentences(buffer);
-            buffer = rest;
-            sentences.forEach(pushSegment);
-          }
-          const tail = buffer.trim();
-          if (tail) pushSegment(tail); // 마침표 없이 끝난 마지막 조각
-        } finally {
-          streamDone = true;
-          waiter.wake?.();
-        }
-      })();
-
-      // 준비된 조각부터 순서대로 재생한다. 뒤 문장은 앞 문장이 나가는 동안 합성된다.
-      let spoken = "";
-      let played = 0;
-      let audioStarted = false;
-      while (played < segments.length || !streamDone) {
-        if (played >= segments.length) {
-          await new Promise<void>((resolve) => {
-            waiter.wake = resolve;
-          });
-          waiter.wake = null;
-          continue;
-        }
-        const segment = segments[played++];
-        const blob = await segment.audio;
-        if (!callActiveRef.current) return;
-        if (!audioStarted) {
-          audioStarted = true;
-          const tAudio = performance.now();
-          const llmStart = t0 + (sttMs ?? 0);
-          setLatencies((prev) => [
-            ...prev,
-            {
-              turn: prev.length + 1,
-              stt: sttMs,
-              llm: (firstSentenceAt ?? tAudio) - llmStart,
-              tts: tAudio - (firstSentenceAt ?? tAudio),
-              total: tAudio - t0,
-            },
-          ]);
-          setStatus("speaking");
-        }
-        spoken = spoken ? `${spoken} ${segment.text}` : segment.text;
-        const caption: Message[] = [...history, { role: "assistant", content: spoken }];
-        await playBlob(blob, () => setConversation(caption));
-      }
-
-      await pump; // 스트림 오류를 여기서 드러낸다
-      if (callActiveRef.current) startListeningRef.current();
-    },
-    [synthesize, playBlob, setConversation],
-  );
-
-  // 사용자 발화 오디오 한 턴 처리: STT → (내용 있으면) assistantRespond.
-  const runUserTurn = useCallback(
-    async (audioBlob: Blob) => {
-      if (!callActiveRef.current) return;
-      setStatus("processing");
-      const t0 = performance.now();
+  // 데이터 채널로 오는 서버 이벤트를 화면 상태로 옮긴다.
+  // 끼어들기는 서버 VAD가 처리한다. 사용자가 말을 시작하면 진행 중이던 응답이 서버에서
+  // 취소·절단되고, 잘린 자막은 transcript.done이 최종본으로 덮어 바로잡는다.
+  const handleServerEvent = useCallback(
+    (raw: string) => {
+      let ev: ServerEvent;
       try {
-        const fd = new FormData();
-        fd.append("audio", audioBlob, "speech.webm");
-        const sttRes = await fetch("/api/stt", { method: "POST", body: fd });
-        if (!sttRes.ok) {
-          const body = await sttRes.json().catch(() => null);
-          throw new Error(body?.error ?? `STT 실패 (${sttRes.status})`);
-        }
-        const { text: userText } = (await sttRes.json()) as { text: string };
-        if (!callActiveRef.current) return;
-        const sttMs = performance.now() - t0;
+        ev = JSON.parse(raw) as ServerEvent;
+      } catch {
+        return;
+      }
 
-        // 무음/빈 인식이면 응답 없이 다시 청취
-        if (!userText.trim()) {
-          startListeningRef.current();
-          return;
+      switch (ev.type) {
+        // 항목 생성 순서가 곧 대화 순서다. 내용은 비운 채 자리만 잡아둔다.
+        // (created는 구버전 이벤트명. 어느 쪽이 와도 순서를 놓치지 않게 함께 받는다)
+        case "conversation.item.added":
+        case "conversation.item.created": {
+          const item = ev.item;
+          const role = item?.role;
+          if (!item?.id || (role !== "user" && role !== "assistant")) break;
+          upsertEntry(item.id, role);
+          break;
         }
-
-        const history: Message[] = [
-          ...messagesRef.current,
-          { role: "user", content: userText },
-        ];
-        setConversation(history);
-        // 위험 판정은 응답 생성과 병렬로 돈다. 직렬로 두면 판정 시간이 첫 소리까지의
-        // 지연에 그대로 더해진다. 위험하면 사기꾼이 말하는 도중에 통화가 끊긴다.
-        void checkGuard(userText, history);
-        await assistantRespond(history, t0, sttMs);
-      } catch (err) {
-        failCall(err instanceof Error ? err.message : "알 수 없는 오류");
+        case "conversation.item.input_audio_transcription.completed": {
+          if (!ev.item_id) break;
+          const text = (ev.transcript ?? "").trim();
+          writeEntry(ev.item_id, "user", text, "set");
+          syncTranscript();
+          if (text) void checkGuard(text, ev.item_id);
+          break;
+        }
+        case "response.output_audio_transcript.delta": {
+          if (!ev.item_id || !ev.delta) break;
+          // 목소리 시작 신호는 output_audio_buffer.started가 정확하지만, 그 이벤트가 오지
+          // 않는 경우에도 연결음이 계속 울지 않도록 첫 자막에서도 같은 처리를 해둔다.
+          startSpeaking();
+          writeEntry(ev.item_id, "assistant", ev.delta, "append");
+          syncTranscript();
+          break;
+        }
+        case "response.output_audio_transcript.done": {
+          if (!ev.item_id) break;
+          writeEntry(ev.item_id, "assistant", ev.transcript ?? "", "set");
+          syncTranscript();
+          break;
+        }
+        // 사기꾼 목소리가 실제로 나오기 시작하는 순간. 연결음은 여기서 끊는다.
+        case "output_audio_buffer.started": {
+          startSpeaking();
+          break;
+        }
+        // 사용자가 말을 시작했다. 사기꾼이 말하는 도중이면 끼어들기이고,
+        // 서버가 진행 중인 응답을 끊는다. (WebRTC라 재생 버퍼는 서버가 정리한다)
+        case "input_audio_buffer.speech_started":
+        // 응답이 끝났거나(response.done) 재생이 멈췄다. 어느 쪽이 와도 청취 상태로 돌린다.
+        case "response.done":
+        case "output_audio_buffer.stopped":
+        case "output_audio_buffer.cleared": {
+          if (callActiveRef.current) setStatus("listening");
+          break;
+        }
+        case "error": {
+          console.error("[realtime]", ev.error);
+          break;
+        }
       }
     },
-    [assistantRespond, checkGuard, failCall, setConversation],
+    [upsertEntry, writeEntry, syncTranscript, checkGuard, startSpeaking],
   );
 
-  // 무음 감지(VAD) 루프. 발화 후 침묵이 이어지면 녹음을 멈춰 턴을 종료한다.
-  const startVad = useCallback(() => {
-    const analyser = analyserRef.current;
-    if (!analyser) return;
-    const buf = new Uint8Array(analyser.fftSize);
-    let speechMs = 0;
-    let silenceMs = 0;
-    let elapsed = 0;
-    let hasSpoken = false;
-
-    vadTimerRef.current = window.setInterval(() => {
-      if (!callActiveRef.current) {
-        if (vadTimerRef.current !== null) clearInterval(vadTimerRef.current);
-        vadTimerRef.current = null;
-        return;
-      }
-      analyser.getByteTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) {
-        const v = (buf[i] - 128) / 128;
-        sum += v * v;
-      }
-      const rms = Math.sqrt(sum / buf.length);
-      elapsed += VAD_INTERVAL_MS;
-      if (rms > VAD_RMS_THRESHOLD) {
-        speechMs += VAD_INTERVAL_MS;
-        silenceMs = 0;
-      } else {
-        silenceMs += VAD_INTERVAL_MS;
-      }
-      if (speechMs >= VAD_MIN_SPEECH_MS) hasSpoken = true;
-
-      const silenceEnd = hasSpoken && silenceMs >= VAD_SILENCE_MS;
-      const maxEnd = elapsed >= VAD_MAX_UTTERANCE_MS;
-      if (!silenceEnd && !maxEnd) return;
-
-      if (vadTimerRef.current !== null) clearInterval(vadTimerRef.current);
-      vadTimerRef.current = null;
-
-      // 30초 동안 발화가 전혀 없으면 STT로 보내지 않고 다시 청취
-      if (maxEnd && !hasSpoken) {
-        const rec = recorderRef.current;
-        if (rec) {
-          rec.onstop = null;
-          try {
-            if (rec.state !== "inactive") rec.stop();
-          } catch {
-            // ignore
-          }
-        }
-        recorderRef.current = null;
-        if (callActiveRef.current) startListeningRef.current();
-        return;
-      }
-
-      recorderRef.current?.stop(); // → onstop → runUserTurn
-    }, VAD_INTERVAL_MS);
-  }, []);
-
-  // 기존 스트림에 새 MediaRecorder를 만들어 청취를 시작한다.
-  const startListening = useCallback(() => {
-    const stream = streamRef.current;
-    if (!callActiveRef.current || !stream) return;
-    setStatus("listening");
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-    chunksRef.current = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) chunksRef.current.push(e.data);
-    };
-    recorder.onstop = () => {
-      if (!callActiveRef.current) return;
-      const blob = new Blob(chunksRef.current, { type: mimeType || "audio/webm" });
-      void runUserTurn(blob);
-    };
-    recorderRef.current = recorder;
-    recorder.start();
-    startVad();
-  }, [runUserTurn, startVad]);
-
-  useEffect(() => {
-    startListeningRef.current = startListening;
-  }, [startListening]);
-
-  // 통화 시작: 시나리오 배정 → 마이크 확보 → 오디오 분석 셋업 → 오프닝 대사 재생.
+  // 통화 시작: 시나리오 배정 → 마이크 확보 → Realtime 세션 발급 → WebRTC 연결 → 오프닝.
   const startCall = useCallback(async () => {
     setError(null);
     clearReport();
-    setConversation([]);
-    setLatencies([]);
+    entriesRef.current = [];
+    syncTranscript();
     setStatus("connecting");
     callActiveRef.current = true;
     // 맞춤 시나리오 생성(F1-1)은 마이크 확보와 병렬로 띄우고 연결음이 우는 동안 기다린다.
@@ -582,7 +364,11 @@ export default function Home() {
       .then((res) => (res.ok ? (res.json() as Promise<Scenario>) : randomScenario()))
       .catch(() => randomScenario());
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // 사기꾼이 말하는 동안에도 마이크는 계속 열려 있다(끼어들기). 스피커로 듣는 데스크톱에서
+      // 자기 목소리가 되돌아 들어가지 않도록 에코 제거를 명시한다.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
       if (!callActiveRef.current) {
         stream.getTracks().forEach((t) => t.stop());
         return;
@@ -595,14 +381,9 @@ export default function Home() {
           .webkitAudioContext;
       const ctx = new AudioCtx();
       await ctx.resume().catch(() => {});
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 2048;
-      source.connect(analyser);
       audioCtxRef.current = ctx;
-      analyserRef.current = analyser;
 
-      // 연결음 즉시 재생 → 오프닝 음성 준비되면 멈추고 재생
+      // 연결음 즉시 재생 → 사기꾼의 첫 목소리가 나올 때 멈춘다.
       startRingback(ctx);
 
       // 시나리오 생성 대기. 연결음이 이 시간을 가린다.
@@ -611,38 +392,106 @@ export default function Home() {
       scenarioRef.current = picked;
       setScenario(picked);
 
-      // 오프닝: 사기꾼이 먼저 말한다. 이 통화의 고정 대사라 LLM 없이 TTS만 태운다.
-      const t0 = performance.now();
-      await speakLine(
-        picked.opening,
-        [{ role: "assistant", content: picked.opening }],
-        t0,
-      );
+      // 임시 키 발급. 시나리오 프롬프트·목소리는 서버가 세션에 심는다.
+      const keyRes = await fetch("/api/realtime", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scenario: picked }),
+      });
+      const keyBody = (await keyRes.json().catch(() => null)) as {
+        value?: string;
+        error?: string;
+      } | null;
+      if (!keyRes.ok || !keyBody?.value) {
+        throw new Error(keyBody?.error ?? `통화 세션 발급 실패 (${keyRes.status})`);
+      }
+      if (!callActiveRef.current) return;
+
+      const pc = new RTCPeerConnection();
+      pcRef.current = pc;
+      pc.addTrack(stream.getAudioTracks()[0], stream);
+      pc.ontrack = (e) => {
+        const el = audioRef.current;
+        if (!el) return;
+        el.srcObject = e.streams[0];
+        el.play().catch(() => {});
+      };
+      pc.onconnectionstatechange = () => {
+        // 통화 도중 연결이 끊기면 여기까지의 대화로 정상 종료한다. (리포트는 그대로 나온다)
+        if (callActiveRef.current && pc.connectionState === "failed") endCall();
+      };
+
+      const dc = pc.createDataChannel("oai-events");
+      dcRef.current = dc;
+      dc.onmessage = (e) => handleServerEvent(e.data as string);
+      dc.onclose = () => {
+        if (callActiveRef.current) endCall();
+      };
+      dc.onopen = () => {
+        // 사기꾼이 먼저 말한다. 오프닝은 이 통화의 고정 대사라 그대로 읽히고,
+        // 응답 항목으로 대화에 남아 이어지는 대사가 맥락을 잃지 않는다.
+        dc.send(
+          JSON.stringify({
+            type: "response.create",
+            response: {
+              instructions: `통화가 방금 연결되었습니다. 다음 오프닝 대사를 그대로 말하세요: "${picked.opening}"`,
+            },
+          }),
+        );
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const sdpRes = await fetch("https://api.openai.com/v1/realtime/calls", {
+        method: "POST",
+        body: offer.sdp,
+        headers: {
+          Authorization: `Bearer ${keyBody.value}`,
+          "Content-Type": "application/sdp",
+        },
+      });
+      if (!sdpRes.ok) {
+        // 응답 본문에 원인(쿼터·권한 등)이 담겨 온다. 화면에는 짧게, 콘솔에는 그대로 남긴다.
+        console.error("[realtime] 연결 실패", sdpRes.status, await sdpRes.text().catch(() => ""));
+        throw new Error(`통화 연결 실패 (${sdpRes.status})`);
+      }
+      await pc.setRemoteDescription({ type: "answer", sdp: await sdpRes.text() });
     } catch (err) {
-      if (err instanceof DOMException) {
+      // WebRTC 쪽 실패도 DOMException으로 오므로 마이크 거부는 이름으로 구분한다.
+      const micDenied =
+        err instanceof DOMException &&
+        (err.name === "NotAllowedError" || err.name === "NotFoundError");
+      if (micDenied) {
         failCall("마이크 권한이 필요합니다.");
       } else {
         failCall(err instanceof Error ? err.message : "통화를 시작할 수 없습니다.");
       }
     }
-  }, [startRingback, speakLine, failCall, setConversation, clearReport]);
+  }, [
+    startRingback,
+    handleServerEvent,
+    syncTranscript,
+    endCall,
+    failCall,
+    clearReport,
+  ]);
 
   const reset = useCallback(() => {
     teardown();
     clearReport();
     scenarioRef.current = null;
     setScenario(null);
-    setConversation([]);
-    setLatencies([]);
+    entriesRef.current = [];
+    syncTranscript();
     setError(null);
     setStatus("idle");
-  }, [teardown, setConversation, clearReport]);
+  }, [teardown, syncTranscript, clearReport]);
 
   // 언마운트 시 리소스 정리
   useEffect(() => {
     return () => {
       callActiveRef.current = false;
-      if (vadTimerRef.current !== null) clearInterval(vadTimerRef.current);
+      pcRef.current?.close();
       audioCtxRef.current?.close().catch(() => {});
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
@@ -660,12 +509,10 @@ export default function Home() {
     : status === "connecting"
       ? "연결 중…"
       : status === "speaking"
-        ? "상대방이 말하는 중…"
+        ? "상대방이 말하는 중… · 끼어들어도 됩니다"
         : status === "listening"
-          ? "듣는 중 · 말이 끝나면 잠시 기다리세요"
-          : status === "processing"
-            ? "처리 중…"
-            : "통화 대기 중";
+          ? "듣는 중 · 편하게 말씀하세요"
+          : "통화 대기 중";
 
   return (
     <main className="flex min-h-screen flex-col items-center gap-6 bg-neutral-900 px-4 py-8 text-neutral-100">
@@ -828,61 +675,13 @@ export default function Home() {
         </div>
       </div>
 
-      <audio ref={audioRef} className="hidden" />
+      {/* 사기꾼 음성(원격 트랙) 재생용 */}
+      <audio ref={audioRef} autoPlay className="hidden" />
 
       {error && (
         <p className="w-full max-w-[520px] rounded bg-red-500/15 px-3 py-2 text-sm text-red-300">
           오류: {error}
         </p>
-      )}
-
-      {/* 지연 측정 패널 — 개발용. 프로덕션 번들에서는 빠진다. */}
-      {SHOW_LATENCY_PANEL && (
-      <div className="w-full max-w-[520px]">
-        <div className="mb-2 flex items-center justify-between">
-          <h2 className="text-sm font-semibold">턴별 지연 (ms)</h2>
-          <button
-            onClick={reset}
-            className="rounded border border-neutral-600 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
-          >
-            초기화
-          </button>
-        </div>
-        <table className="w-full border-collapse text-xs">
-          <thead>
-            <tr className="text-neutral-400">
-              <th className="border-b border-neutral-700 py-1 text-left">턴</th>
-              <th className="border-b border-neutral-700 py-1 text-right">STT</th>
-              <th className="border-b border-neutral-700 py-1 text-right">LLM</th>
-              <th className="border-b border-neutral-700 py-1 text-right">TTS</th>
-              <th className="border-b border-neutral-700 py-1 text-right">합계</th>
-            </tr>
-          </thead>
-          <tbody>
-            {latencies.length === 0 ? (
-              <tr>
-                <td colSpan={5} className="py-2 text-center text-neutral-500">
-                  아직 측정된 턴이 없습니다.
-                </td>
-              </tr>
-            ) : (
-              latencies.map((l) => (
-                <tr key={l.turn}>
-                  <td className="py-1">{l.turn}</td>
-                  <td className="py-1 text-right">{l.stt === null ? "—" : round(l.stt)}</td>
-                  <td className="py-1 text-right">{round(l.llm)}</td>
-                  <td className="py-1 text-right">{round(l.tts)}</td>
-                  <td className="py-1 text-right font-semibold">{round(l.total)}</td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-        <p className="mt-2 text-[11px] text-neutral-500">
-          합계 = 턴 시작 → <b>첫 음성이 나오기까지</b>. LLM은 첫 문장이 완성되기까지, TTS는 그 문장의
-          합성 시간. 목표 ≤ 4000ms, 허용 ≤ 7000ms. (오프닝 턴은 STT 없음)
-        </p>
-      </div>
       )}
     </main>
   );
