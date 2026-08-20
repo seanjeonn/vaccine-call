@@ -11,9 +11,14 @@ export type VoicePipeline = "realtime" | "typecast";
 
 const PIPELINES: VoicePipeline[] = ["realtime", "typecast"];
 
-// 검증이 끝날 때까지 기본값은 realtime이다. 무중단이 결격 조건이라 기본값을 옮기는 것은
-// 지연·끼어들기·자멸 없음이 전부 확인된 뒤에 한다.
-export const DEFAULT_PIPELINE: VoicePipeline = "realtime";
+// 훈련 통화의 기본 목소리. 블라인드 청취에서 Typecast가 현행보다 확실히 낫다는 판정이
+// 나와 기본값을 옮겼다(2026-08-21). 대가는 지연 +427ms(p50)이고, 근거와 수치는
+// docs/planning/tts-provider-spike.md에 있다.
+//
+// 되돌리는 방법은 두 가지다 — 환경변수 NEXT_PUBLIC_VOICE_PIPELINE=realtime,
+// 또는 통화 URL에 ?pipeline=realtime. 후자는 재배포가 필요 없어 데모 중 비상 레버다.
+// Typecast 키가 없거나 응답하지 않으면 통화 페이지가 알아서 realtime으로 되돌아간다.
+export const DEFAULT_PIPELINE: VoicePipeline = "typecast";
 
 function parse(value: string | null | undefined): VoicePipeline | null {
   return PIPELINES.find((p) => p === value) ?? null;

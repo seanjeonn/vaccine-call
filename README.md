@@ -79,12 +79,14 @@ AI가 사기꾼을 연기해 부모님께 모의 훈련 전화를 걸고, 훈련
 | STT | OpenAI `gpt-4o-mini-transcribe` (ko) — 코파일럿·사무장 |
 | LLM | OpenAI `gpt-4o` / `gpt-4o-mini` — 분석·판정·서류 |
 | TTS | OpenAI `gpt-4o-mini-tts` (시나리오별 voice/톤) — 코파일럿·사무장 |
-| 사기범 목소리 (F1, 선택) | Typecast `ssfm-v30` — 한국어가 `gpt-realtime`보다 자연스럽다 |
+| 사기범 목소리 (F1) | Typecast `ssfm-v30` — 한국어가 `gpt-realtime`보다 자연스럽다 |
 | 배포 | Vercel (예정) |
 
 키는 전부 서버에만 둔다. API 라우트가 프록시 역할을 하여 클라이언트에 노출되지 않으며, Realtime 통화도 서버가 발급한 임시 키(`/api/realtime`)로만 연결된다.
 
-훈련 통화의 목소리는 두 경로 중 하나를 탄다. 기본은 `realtime`(모델이 음성을 직접 낸다)이고, `NEXT_PUBLIC_VOICE_PIPELINE=typecast`로 바꾸면 모델은 텍스트만 내고 목소리는 Typecast가 만든다. 어느 쪽이든 서버 VAD가 턴 종료와 끼어들기를 감지한다. 통화 중 `/call?pipeline=realtime` 쿼리가 설정값을 덮어쓰므로 재배포 없이 되돌릴 수 있다. 선정 근거와 실측은 [`docs/planning/tts-provider-spike.md`](docs/planning/tts-provider-spike.md).
+훈련 통화의 목소리는 두 경로 중 하나를 탄다. 기본은 `typecast` — 모델은 텍스트만 내고 목소리는 Typecast가 만든다. `NEXT_PUBLIC_VOICE_PIPELINE=realtime`으로 바꾸면 모델이 음성을 직접 낸다. 어느 쪽이든 서버 VAD가 턴 종료와 끼어들기를 감지한다.
+
+`/call?pipeline=realtime` 쿼리가 설정값을 덮어쓰므로 재배포 없이 되돌릴 수 있고, Typecast 키가 없거나 응답하지 않으면 통화가 알아서 `realtime`으로 시작한다. 선정 근거와 실측은 [`docs/planning/tts-provider-spike.md`](docs/planning/tts-provider-spike.md).
 
 ## 실행
 
