@@ -415,6 +415,8 @@ export default function Home() {
         }
         case "response.created": {
           responseActiveRef.current = true;
+          // 조각 번호와 재생 차례를 되돌린다. 응답마다 0번부터 다시 세야 순서가 맞다.
+          playbackRef.current?.begin();
           break;
         }
         // 사용자가 말을 시작했다. 사기꾼이 말하는 도중이면 끼어들기다.
