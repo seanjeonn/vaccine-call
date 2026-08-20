@@ -162,20 +162,65 @@ function activeProviders(only?: string): ProviderId[] {
 
 // --- voice 목록 -------------------------------------------------------------
 
-type VoiceCandidate = { provider: ProviderId; voiceId: string; name: string; detail: string };
+type VoiceCandidate = {
+  provider: ProviderId;
+  voiceId: string;
+  name: string;
+  detail: string;
+  /** ElevenLabs 라이브러리 voice의 소유자. 워크스페이스에 추가할 때 필요하다. */
+  ownerId?: string;
+};
 
+// ElevenLabs 기본 제공 voice는 전부 영어 원어민이라 한국어를 읽히면 억양이 남는다.
+// 한국어 네이티브는 라이브러리의 Professional 클론에만 있고, 그쪽에 언어 태그가 붙는다.
+// (무료 티어는 라이브러리 API를 못 쓴다 — Starter 이상 필요)
 async function elevenKoreanVoices(): Promise<VoiceCandidate[]> {
-  const res = await fetch("https://api.elevenlabs.io/v1/shared-voices?language=ko&page_size=40", {
-    headers: { "xi-api-key": ELEVEN_KEY! },
-  });
+  const url =
+    "https://api.elevenlabs.io/v1/shared-voices" +
+    "?language=ko&category=professional&page_size=40&sort=cloned_by_count";
+  const res = await fetch(url, { headers: { "xi-api-key": ELEVEN_KEY! } });
   if (!res.ok) throw new Error(`eleven voices ${res.status}: ${(await res.text()).slice(0, 300)}`);
   const body = (await res.json()) as { voices?: Array<Record<string, string>> };
   return (body.voices ?? []).map((v) => ({
     provider: "eleven" as const,
     voiceId: v.voice_id,
     name: v.name,
+    ownerId: v.public_owner_id,
     detail: [v.gender, v.age, v.accent, v.descriptive, v.use_case].filter(Boolean).join(" / "),
   }));
+}
+
+// 라이브러리 voice는 워크스페이스에 추가해야 TTS에서 쓸 수 있다. 추가는 소유자가 나중에
+// 공유를 내려도 우리 쪽 voice_id가 살아남게 하는 고정 장치이기도 하다 — 심사 기간에
+// 404가 나면 그대로 결격이므로 스파이크 단계에서 미리 붙여 둔다.
+const addedVoices = new Map<string, string>();
+
+async function ensureElevenVoice(v: VoiceCandidate): Promise<string> {
+  if (!v.ownerId) return v.voiceId; // 이미 내 워크스페이스 voice
+  const cached = addedVoices.get(v.voiceId);
+  if (cached) return cached;
+
+  const res = await fetch(`https://api.elevenlabs.io/v1/voices/add/${v.ownerId}/${v.voiceId}`, {
+    method: "POST",
+    headers: { "xi-api-key": ELEVEN_KEY!, "Content-Type": "application/json" },
+    body: JSON.stringify({ new_name: `spike-${v.name}`.slice(0, 100) }),
+  });
+  if (!res.ok) {
+    // 이미 추가돼 있으면 원래 id가 그대로 동작한다. 그 외 실패는 호출자가 보게 둔다.
+    const detail = (await res.text()).slice(0, 200);
+    if (!/already/i.test(detail)) throw new Error(`eleven add ${res.status}: ${detail}`);
+    addedVoices.set(v.voiceId, v.voiceId);
+    return v.voiceId;
+  }
+  const body = (await res.json()) as { voice_id?: string };
+  const id = body.voice_id ?? v.voiceId;
+  addedVoices.set(v.voiceId, id);
+  return id;
+}
+
+/** 프로바이더에 맞는, 실제로 합성에 쓸 수 있는 voice id. */
+async function usableVoiceId(v: VoiceCandidate): Promise<string> {
+  return v.provider === "eleven" ? ensureElevenVoice(v) : v.voiceId;
 }
 
 async function typecastKoreanVoices(): Promise<VoiceCandidate[]> {
@@ -251,7 +296,7 @@ async function runModeration(only?: string) {
     }
     for (const line of spikeLines()) {
       try {
-        const out = await PROVIDERS[provider].synth(voice.voiceId, line.text, line.scenario);
+        const out = await PROVIDERS[provider].synth(await usableVoiceId(voice), line.text, line.scenario);
         const ok = out.audio.length > 0;
         rows.push(`${provider} ${line.scenario}/${line.kind}: ${ok ? "합성됨" : "빈 응답"} (${out.audio.length}B)`);
       } catch (err) {
@@ -270,6 +315,8 @@ async function runVoices(only?: string) {
     const voices = provider === "eleven" ? await elevenKoreanVoices() : await typecastKoreanVoices();
     console.log(`\n=== ${provider} 한국어 voice (${voices.length}) ===`);
     voices.forEach((v) => console.log(`  ${v.voiceId}  ${v.name.padEnd(24)} ${v.detail}`));
+    if (provider === "eleven" && !voices.length)
+      console.log("  (비어 있음 — 무료 티어는 라이브러리 API를 쓸 수 없다. Starter 이상 필요)");
   }
   console.log("\n배역별 3~5개를 골라 --voices 인자로 samples에 넘긴다.");
   console.log("  institution: 낮고 건조한 40대 남성 / family: 20대 후반 남성 / loan: 30대 여성 상담원");
@@ -301,7 +348,7 @@ async function runSamples(only: string | undefined, voiceArg: string | undefined
     for (const voice of voices) {
       for (const line of spikeLines()) {
         try {
-          const out = await PROVIDERS[provider].synth(voice.voiceId, line.text, line.scenario);
+          const out = await PROVIDERS[provider].synth(await usableVoiceId(voice), line.text, line.scenario);
           const blindId = createHash("sha256")
             .update(`${randomUUID()}|${provider}|${voice.voiceId}|${line.scenario}|${line.kind}`)
             .digest("hex")
@@ -351,10 +398,11 @@ async function runLatency(only: string | undefined, reps: number, voiceArg: stri
     // 오프닝 세 개만 쓴다. 첫 문장의 지연이 통화 체감을 좌우한다.
     const lines = spikeLines().filter((l) => l.kind === "opening");
     const samples: number[] = [];
+    const voiceId = await usableVoiceId(voice);
     for (let i = 0; i < reps; i++) {
       const line = lines[i % lines.length];
       try {
-        const out = await PROVIDERS[provider].synth(voice.voiceId, line.text, line.scenario);
+        const out = await PROVIDERS[provider].synth(voiceId, line.text, line.scenario);
         samples.push(out.ttfbMs);
       } catch (err) {
         console.error(`  실패: ${(err as Error).message}`);
