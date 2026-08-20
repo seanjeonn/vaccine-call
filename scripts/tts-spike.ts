@@ -22,6 +22,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import OpenAI from "openai";
 import { SCENARIOS, type ScenarioId } from "../lib/scenarios.ts";
+import { SCENARIO_VOICES, TYPECAST_SAMPLE_RATE, typecastRequest, type VoiceSpec } from "../lib/tts-voices.ts";
 import { REALTIME_MODEL, buildSessionConfig, openingResponseInstructions } from "../lib/realtime-session.ts";
 import { SCRIPTS, VICTIM_TONE, VICTIM_VOICE } from "./victim-scripts.ts";
 
@@ -36,8 +37,6 @@ const FRAME_BYTES = (BYTES_PER_SEC * FRAME_MS) / 1000; // 1920
 
 const TYPECAST_KEY = process.env.TYPECAST_API_KEY;
 const TYPECAST_MODEL = "ssfm-v30";
-// 스트리밍 응답 포맷. 첫 청크에 44바이트 WAV 헤더가 붙고 이후는 raw PCM이다.
-const TYPECAST_RATE = 32000;
 
 // --- 대사 -----------------------------------------------------------------
 
@@ -60,18 +59,6 @@ function spikeLines(): SpikeLine[] {
   ]);
 }
 
-// --- 배역별 톤 파라미터 ------------------------------------------------------
-
-// 시작점일 뿐이다. Phase 0 청취 결과로 조정한다. 근거는 lib/scenarios.ts의 ttsInstructions.
-// 프리셋 7종(normal/happy/sad/angry/whisper/toneup/tonedown)에 "당황·다급"이 없다.
-// family는 sad를 세게 건 것이 최근사고, 느린 슬픔으로 들리면 toneup으로 바꿔 본다.
-// intensity는 0.0~2.0, 기본 1.0.
-const PROMPTS: Record<ScenarioId, { emotion: string; intensity: number; pitch: number; tempo: number }> = {
-  institution: { emotion: "tonedown", intensity: 1.2, pitch: -2, tempo: 0.95 }, // 감정 없는 사무적 수사관
-  family: { emotion: "sad", intensity: 1.6, pitch: 1, tempo: 1.12 }, // 숨차고 울먹이는 아들
-  loan: { emotion: "happy", intensity: 1.1, pitch: 0, tempo: 1.12 }, // 매끄럽고 빠른 영업 말투
-};
-
 // --- Typecast 호출 -----------------------------------------------------------
 
 // ttfb는 첫 바이트, ttfa는 44바이트 WAV 헤더를 넘어선 첫 오디오 바이트까지의 시간이다.
@@ -80,21 +67,13 @@ type Synth = { audio: Buffer; ttfbMs: number; ttfaMs: number };
 
 async function synth(voiceId: string, text: string, scenario: ScenarioId): Promise<Synth> {
   if (!TYPECAST_KEY) throw new Error("TYPECAST_API_KEY가 없습니다.");
-  const p = PROMPTS[scenario];
+  // 배역의 톤 파라미터는 쓰되 목소리는 호출자가 정한다 — 후보를 바꿔 가며 듣기 위해서다.
+  const spec: VoiceSpec = { ...SCENARIO_VOICES[scenario], voiceId };
   const startedAt = performance.now();
   const res = await fetch("https://api.typecast.ai/v1/text-to-speech/stream", {
     method: "POST",
     headers: { "X-API-KEY": TYPECAST_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      voice_id: voiceId,
-      text,
-      model: TYPECAST_MODEL,
-      language: "kor",
-      // emotion_type은 판별자다. 프리셋 이름은 emotion_preset에 들어간다.
-      prompt: { emotion_type: "preset", emotion_preset: p.emotion, emotion_intensity: p.intensity },
-      // 스트리밍에서는 volume을 못 쓴다. 레벨은 target_lufs로만 맞춘다.
-      output: { audio_format: "wav", audio_pitch: p.pitch, audio_tempo: p.tempo, target_lufs: -16 },
-    }),
+    body: JSON.stringify(typecastRequest(spec, text)),
   });
   if (!res.ok) {
     const detail = (await res.text()).slice(0, 300);
@@ -310,7 +289,7 @@ async function runSamples(voiceArg: string | undefined, limit: number) {
           .update(`${randomUUID()}|${voice.voiceId}|${line.scenario}|${line.kind}`)
           .digest("hex")
           .slice(0, 12);
-        writeFileSync(join(SAMPLE_DIR, `${blindId}.wav`), toWav(out.audio, TYPECAST_RATE));
+        writeFileSync(join(SAMPLE_DIR, `${blindId}.wav`), toWav(out.audio, TYPECAST_SAMPLE_RATE));
         manifest.blind[blindId] = {
           voiceId: voice.voiceId,
           voiceName: voice.name,
@@ -333,6 +312,40 @@ async function runSamples(voiceArg: string | undefined, limit: number) {
   console.log(`정답표 → ${join(OUT_DIR, "manifest.json")} (청취가 끝날 때까지 열지 말 것)`);
   console.log("청취: npm run dev 후 http://localhost:3000/spike/listen");
   console.log("현행 목소리 대조군: eval-runs/2026-08-16T09-04-prosody-v4/audio/*.wav");
+}
+
+// --- 모드: assigned ----------------------------------------------------------
+
+// 최종 배정(lib/tts-voices.ts)을 그대로 렌더한다. 후보 청취와 다른 점은 두 가지다 —
+// 목소리와 배역이 실제 조합대로 붙고, 파일명이 블라인드가 아니다. 배정을 바꿀 때마다
+// 이걸 돌려 확인한다.
+async function runAssigned() {
+  const all = await allVoices();
+  const name = (id: string) => all.find((v) => v.voiceId === id)?.name ?? "(카탈로그에 없음)";
+
+  mkdirSync(SAMPLE_DIR, { recursive: true });
+  const files: string[] = [];
+
+  console.log("=== 최종 배정 렌더 ===\n");
+  for (const s of SCENARIOS) {
+    const spec = SCENARIO_VOICES[s.id];
+    console.log(`${s.id} → ${name(spec.voiceId)} (${spec.emotion} ${spec.intensity}, pitch ${spec.pitch}, tempo ${spec.tempo})`);
+    for (const line of spikeLines().filter((l) => l.scenario === s.id)) {
+      try {
+        const out = await synth(spec.voiceId, line.text, s.id);
+        const file = `assigned-${s.id}-${line.kind}.wav`;
+        writeFileSync(join(SAMPLE_DIR, file), toWav(out.audio, TYPECAST_SAMPLE_RATE));
+        files.push(file);
+        console.log(`  ${file}`);
+      } catch (err) {
+        console.error(`  실패 ${line.kind}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  writeFileSync(join(SAMPLE_DIR, "index.json"), JSON.stringify(files, null, 2));
+  console.log("\n청취: npm run dev 후 http://localhost:3000/spike/listen");
+  console.log("이번엔 파일명에 배역이 드러난다. 배정 확인용이라 블라인드가 아니다.");
 }
 
 // --- 모드: latency -----------------------------------------------------------
@@ -592,13 +605,15 @@ async function main() {
       return runVoices(Number(arg("limit") ?? 6));
     case "samples":
       return runSamples(voices, Number(arg("limit") ?? 4));
+    case "assigned":
+      return runAssigned();
     case "latency":
       return runLatency(reps, voices);
     case "baseline":
       return runBaseline(Number(arg("reps") ?? 10), process.argv.includes("--text"));
     default:
       console.log("사용법: node --env-file=.env scripts/tts-spike.ts <mode>");
-      console.log("  moderation | voices | samples | latency | baseline");
+      console.log("  moderation | voices | samples | assigned | latency | baseline");
       console.log("  옵션: --reps N  --voices id1,id2  --limit N(배역별 후보 수)");
       console.log("  baseline --text 는 output_modalities:[\"text\"] 경로를 잰다.");
       console.log("\n권장 순서: moderation → voices → samples(청취) → latency");
