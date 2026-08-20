@@ -34,7 +34,7 @@ type ServerEvent = {
   transcript?: string;
   text?: string;
   delta?: string;
-  error?: unknown;
+  error?: { code?: string; message?: string };
 };
 
 export default function Home() {
@@ -440,6 +440,9 @@ export default function Home() {
           break;
         }
         case "error": {
+          // 취소가 서버에 닿기 전에 응답이 스스로 끝나면 이 코드가 온다. 플래그로는 못 막는
+          // 경합이고, 애초에 원하던 결과(진행 중인 응답 없음)라 조용히 넘긴다.
+          if (ev.error?.code === "response_cancel_not_active") break;
           console.error("[realtime]", ev.error);
           break;
         }
