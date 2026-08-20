@@ -12,6 +12,20 @@ const RETRY_DELAYS_MS = [200, 500];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// fetch가 던진 이유를 짧은 코드로 뽑는다. Node는 실제 원인을 err.cause에 담는다
+// (ENOTFOUND, ECONNREFUSED, UND_ERR_CONNECT_TIMEOUT 등).
+//
+// 응답에도 실어 보낸다. 배포 환경에서 이 라우트가 죽었을 때 로그 접근 없이 원인을
+// 좁힐 수 있어야 한다 — 코드 문자열이라 비밀이 새지 않는다.
+function failureCause(err: unknown): string {
+  if (!(err instanceof Error)) return "unknown";
+  const cause = (err as { cause?: unknown }).cause as
+    | { code?: string; errors?: Array<{ code?: string }> }
+    | undefined;
+  // 연결 실패는 AggregateError로 한 겹 더 감싸여 온다. 코드는 그 안에 있다.
+  return cause?.code ?? cause?.errors?.find((e) => e?.code)?.code ?? err.name ?? "unknown";
+}
+
 // 훈련 통화(F1)의 사기범 대사 한 조각을 Typecast로 합성해 그대로 흘려보낸다.
 //
 // 프록시인 이유: Typecast는 X-API-KEY 헤더 인증뿐이고 브라우저용 단일 사용 토큰이 없다.
@@ -77,8 +91,9 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     // 끼어들기로 클라이언트가 요청을 끊으면 여기로 온다. 오류가 아니다.
     if (req.signal.aborted) return new Response(null, { status: 499 });
-    console.error("[voice] error", err);
-    return NextResponse.json({ error: "음성 합성 실패" }, { status: 500 });
+    const cause = failureCause(err);
+    console.error("[voice] error", cause, err);
+    return NextResponse.json({ error: "음성 합성 실패", cause }, { status: 500 });
   }
 }
 
