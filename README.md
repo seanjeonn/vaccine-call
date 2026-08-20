@@ -78,17 +78,19 @@ AI가 사기꾼을 연기해 부모님께 모의 훈련 전화를 걸고, 훈련
 | 모의 훈련 통화 (F1) | OpenAI Realtime `gpt-realtime` (WebRTC, 서버 VAD, 전사 `gpt-4o-mini-transcribe`) |
 | STT | OpenAI `gpt-4o-mini-transcribe` (ko) — 코파일럿·사무장 |
 | LLM | OpenAI `gpt-4o` / `gpt-4o-mini` — 분석·판정·서류 |
-| TTS | OpenAI `gpt-4o-mini-tts` (시나리오별 voice/톤) |
+| TTS | OpenAI `gpt-4o-mini-tts` (시나리오별 voice/톤) — 코파일럿·사무장 |
+| 사기범 목소리 (F1, 선택) | Typecast `ssfm-v30` — 한국어가 `gpt-realtime`보다 자연스럽다 |
 | 배포 | Vercel (예정) |
 
-OpenAI 키 하나로 전부 처리한다. 서버 API 라우트가 키 프록시 역할을 하여 클라이언트에 키가 노출되지 않는다.
-Realtime 통화도 마찬가지로 서버가 발급한 임시 키(`/api/realtime`)로만 연결되며, 실제 키는 브라우저로 나가지 않는다.
+키는 전부 서버에만 둔다. API 라우트가 프록시 역할을 하여 클라이언트에 노출되지 않으며, Realtime 통화도 서버가 발급한 임시 키(`/api/realtime`)로만 연결된다.
+
+훈련 통화의 목소리는 두 경로 중 하나를 탄다. 기본은 `realtime`(모델이 음성을 직접 낸다)이고, `NEXT_PUBLIC_VOICE_PIPELINE=typecast`로 바꾸면 모델은 텍스트만 내고 목소리는 Typecast가 만든다. 어느 쪽이든 서버 VAD가 턴 종료와 끼어들기를 감지한다. 통화 중 `/call?pipeline=realtime` 쿼리가 설정값을 덮어쓰므로 재배포 없이 되돌릴 수 있다. 선정 근거와 실측은 [`docs/planning/tts-provider-spike.md`](docs/planning/tts-provider-spike.md).
 
 ## 실행
 
 ```bash
 npm install
-cp .env.example .env         # OPENAI_API_KEY, DATABASE_URL 입력
+cp .env.example .env         # OPENAI_API_KEY, DATABASE_URL 입력 (Typecast는 선택)
 npx prisma migrate deploy    # 스키마 적용
 npm run db:seed              # 데모 계정·리포트 생성 (선택)
 npm run dev                  # http://localhost:3000

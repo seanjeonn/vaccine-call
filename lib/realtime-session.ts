@@ -83,7 +83,17 @@ ${scenario.ttsInstructions}
 
 // client_secrets(WebRTC)와 session.update(WebSocket)가 공유하는 세션 설정.
 // WebSocket은 모델을 URL 쿼리로 고정하므로 model 필드를 빼고 쓴다.
-export function buildSessionConfig(scenario: Scenario) {
+//
+// textOut이면 모델이 음성 대신 텍스트만 내고 목소리는 외부 TTS가 만든다. 이때도
+// audio.input(전사·far_field·server_vad)은 그대로 둔다 — 턴 종료와 끼어들기 감지가
+// 거기 걸려 있고, 그 파라미터들은 고령 사용자 기준으로 이미 튜닝된 값이다.
+export function buildSessionConfig(scenario: Scenario, opts?: { textOut?: boolean }) {
+  const output = opts?.textOut
+    ? {}
+    : {
+        format: { type: "audio/pcm", rate: 24000 },
+        voice: REALTIME_VOICES[scenario.voice] ?? DEFAULT_VOICE,
+      };
   return {
     type: "realtime",
     model: REALTIME_MODEL,
@@ -105,12 +115,9 @@ export function buildSessionConfig(scenario: Scenario) {
           idle_timeout_ms: null,
         },
       },
-      output: {
-        format: { type: "audio/pcm", rate: 24000 },
-        voice: REALTIME_VOICES[scenario.voice] ?? DEFAULT_VOICE,
-      },
+      ...(opts?.textOut ? {} : { output }),
     },
-    output_modalities: ["audio"],
+    output_modalities: [opts?.textOut ? "text" : "audio"],
     max_output_tokens: "inf",
   };
 }

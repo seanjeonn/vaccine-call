@@ -529,7 +529,7 @@ async function runSample(
     if (echoed.instructions !== buildInstructions(scenario)) {
       throw new Error("session_config_mismatch:instructions");
     }
-    if (opts.mode === "audio" && echoed.audio?.output?.voice !== full.audio.output.voice) {
+    if (opts.mode === "audio" && echoed.audio?.output?.voice !== full.audio.output?.voice) {
       throw new Error("session_config_mismatch:voice");
     }
 
@@ -879,7 +879,7 @@ async function main() {
   console.log(`\n계획: ${plan.length}샘플 (${opts.scenarios.join(",")} × ${opts.personas.join(",")} × ${opts.reps}회), ${opts.turns}턴, mode=${opts.mode}, 동시 ${opts.concurrency}`);
   console.log(`추정 비용: $${(plan.length * (opts.mode === "audio" ? 0.08 : 0.015)).toFixed(2)} (오디오 기준 샘플당 ~$0.08)`);
   for (const s of scenarios) {
-    console.log(`  ${s.id}: instructions ${sha(buildInstructions(s)).slice(0, 12)} / voice ${buildSessionConfig(s).audio.output.voice}`);
+    console.log(`  ${s.id}: instructions ${sha(buildInstructions(s)).slice(0, 12)} / voice ${buildSessionConfig(s).audio.output?.voice}`);
   }
   if (opts.dryRun) {
     console.log(`\n--- 세션 설정 (${scenarios[0].id}) ---`);

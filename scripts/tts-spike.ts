@@ -23,6 +23,7 @@ import { join } from "node:path";
 import OpenAI from "openai";
 import { SCENARIOS, type ScenarioId } from "../lib/scenarios.ts";
 import { SCENARIO_VOICES, TYPECAST_SAMPLE_RATE, typecastRequest, type VoiceSpec } from "../lib/tts-voices.ts";
+import { chunkEnd } from "../lib/tts-chunk.ts";
 import { REALTIME_MODEL, buildSessionConfig, openingResponseInstructions } from "../lib/realtime-session.ts";
 import { SCRIPTS, VICTIM_TONE, VICTIM_VOICE } from "./victim-scripts.ts";
 
@@ -393,7 +394,7 @@ async function runLatency(reps: number, voiceArg: string | undefined) {
 // 현행 Realtime의 "발화 종료 → 첫 소리" 지연. 한 번도 실측된 적이 없어서, 이 값 없이는
 // 교체 후 수치가 회귀인지 개선인지 말할 수 없다. eval 하네스와 같은 WebSocket 경로를 쓴다.
 // 브라우저 WebRTC는 여기에 지터가 더 붙으므로 이 값은 하한이다.
-async function runBaseline(reps: number, textOut: boolean) {
+async function runBaseline(reps: number, textOut: boolean, endToEnd: boolean) {
   if (!process.env.OPENAI_API_KEY) return console.error("OPENAI_API_KEY가 없습니다.");
 
   console.log(`=== baseline: ${textOut ? "텍스트 출력" : "현행 오디오 출력"} 응답 지연 (${reps}회) ===`);
@@ -403,20 +404,23 @@ async function runBaseline(reps: number, textOut: boolean) {
   const opening: number[] = [];
   const turn: number[] = [];
   const sentence: number[] = [];
+  const e2e: number[] = [];
   const firstSentences: string[] = [];
 
   for (let i = 0; i < reps; i++) {
     try {
-      const r = await oneBaselineCall(scenario, textOut);
+      const r = await oneBaselineCall(scenario, textOut, endToEnd);
       opening.push(r.openingMs);
       turn.push(r.turnMs);
       if (r.sentenceMs) {
         sentence.push(r.sentenceMs);
         firstSentences.push(r.firstSentence);
       }
+      if (r.endToEndMs) e2e.push(r.endToEndMs);
       console.log(
-        `  ${i + 1}/${reps}: 오프닝 ${ms(r.openingMs)}  대화 중 턴 ${ms(r.turnMs)}` +
-          (r.sentenceMs ? `  첫 문장 완성 ${ms(r.sentenceMs)}` : ""),
+        `  ${i + 1}/${reps}: 오프닝 ${ms(r.openingMs)}  턴 ${ms(r.turnMs)}` +
+          (r.sentenceMs ? `  첫 조각 ${ms(r.sentenceMs)}` : "") +
+          (r.endToEndMs ? `  첫 소리 ${ms(r.endToEndMs)}` : ""),
       );
     } catch (err) {
       console.error(`  실패: ${(err as Error).message}`);
@@ -433,12 +437,17 @@ async function runBaseline(reps: number, textOut: boolean) {
   console.log("");
   report("오프닝", opening);
   report("대화 중 턴(첫 델타)", turn);
-  if (sentence.length) report("첫 문장 완성", sentence);
+  if (sentence.length) report("첫 조각 완성", sentence);
+  if (e2e.length) report("첫 소리(종단)", e2e);
   console.log("\n오프닝은 전체 지시문이 통째로 실리는 최악 조건이다. 비교 기준은 '대화 중 턴'.");
   if (textOut) {
-    // Typecast는 완성된 문장을 요청 단위로 받는다. 첫 델타가 아니라 첫 문장이 끝나야 합성이 시작된다.
-    console.log("Typecast는 완성된 문장을 받아야 하므로 실제 트리거는 '첫 문장 완성'이다.");
-    console.log("교체 후 체감 지연 = 첫 문장 완성 + TTS 첫 오디오.");
+    // Typecast는 완성된 조각을 요청 단위로 받는다. 첫 델타가 아니라 조각이 끊겨야 합성이 시작된다.
+    console.log("첫 조각은 lib/tts-playback.ts와 같은 규칙으로 끊는다 (첫 조각만 쉼표 허용).");
+    if (e2e.length) {
+      console.log("'첫 소리(종단)'가 교체 후 실제 체감 지연이다. 현행 오디오 출력의 855ms와 비교한다.");
+    } else {
+      console.log("--e2e 를 붙이면 실제로 합성까지 해서 첫 소리까지의 총합을 잰다.");
+    }
     if (firstSentences.length) {
       const lens = firstSentences.map((t) => t.length);
       console.log(`첫 문장 길이: 중앙값 ${percentile(lens, 50)}자 (min ${Math.min(...lens)} / max ${Math.max(...lens)})`);
@@ -475,7 +484,14 @@ async function victimPcm(text: string): Promise<Buffer> {
 async function oneBaselineCall(
   scenario: (typeof SCENARIOS)[number],
   textOut: boolean,
-): Promise<{ openingMs: number; turnMs: number; sentenceMs: number; firstSentence: string }> {
+  measureEndToEnd: boolean,
+): Promise<{
+  openingMs: number;
+  turnMs: number;
+  sentenceMs: number;
+  firstSentence: string;
+  endToEndMs: number;
+}> {
   const pcm = await victimPcm(SCRIPTS[scenario.id].skeptical[0].text);
 
   return new Promise((resolve, reject) => {
@@ -489,6 +505,7 @@ async function oneBaselineCall(
     }, 60_000);
 
     let phase: "opening" | "speaking" | "turn" = "opening";
+    let e2eStarted = false;
     let askedAt = 0;
     let stoppedAt = 0;
     let openingMs = 0;
@@ -496,7 +513,9 @@ async function oneBaselineCall(
     let buffered = "";
 
     const finish = (
-      value: { openingMs: number; turnMs: number; sentenceMs: number; firstSentence: string } | Error,
+      value:
+        | { openingMs: number; turnMs: number; sentenceMs: number; firstSentence: string; endToEndMs: number }
+        | Error,
     ) => {
       clearTimeout(timer);
       ws.close();
@@ -552,18 +571,32 @@ async function oneBaselineCall(
             phase = "speaking";
           } else if (phase === "turn" && stoppedAt) {
             if (!turnMs) turnMs = performance.now() - stoppedAt;
-            if (!textOut) return finish({ openingMs, turnMs, sentenceMs: 0, firstSentence: "" });
-            // 문장 경계까지 모은다. 한국어 종결부호 + 줄바꿈.
+            if (!textOut) return finish({ openingMs, turnMs, sentenceMs: 0, firstSentence: "", endToEndMs: 0 });
+            // 프로덕션과 같은 규칙으로 첫 조각을 끊는다 (lib/tts-playback.ts).
             buffered += (ev as { delta?: string }).delta ?? "";
-            const m = /[.!?…\n]/.exec(buffered);
-            if (m) {
-              finish({
-                openingMs,
-                turnMs,
-                sentenceMs: performance.now() - stoppedAt,
-                firstSentence: buffered.slice(0, m.index + 1).trim(),
-              });
+            const cut = chunkEnd(buffered.trimStart(), true);
+            if (cut < 0 || e2eStarted) break;
+            e2eStarted = true;
+            const chunk = buffered.trimStart().slice(0, cut);
+            const chunkReadyAt = performance.now();
+            const sentenceMs = chunkReadyAt - stoppedAt;
+
+            if (!measureEndToEnd) {
+              finish({ openingMs, turnMs, sentenceMs, firstSentence: chunk, endToEndMs: 0 });
+              break;
             }
+            // 그 조각을 실제로 합성해 첫 소리까지의 총합을 잰다. 예측이 아니라 실측이 된다.
+            void synth(SCENARIO_VOICES[scenario.id].voiceId, chunk, scenario.id)
+              .then((out) =>
+                finish({
+                  openingMs,
+                  turnMs,
+                  sentenceMs,
+                  firstSentence: chunk,
+                  endToEndMs: chunkReadyAt - stoppedAt + out.ttfaMs,
+                }),
+              )
+              .catch((err) => finish(err as Error));
           }
           break;
         case "response.done":
@@ -610,12 +643,16 @@ async function main() {
     case "latency":
       return runLatency(reps, voices);
     case "baseline":
-      return runBaseline(Number(arg("reps") ?? 10), process.argv.includes("--text"));
+      return runBaseline(
+        Number(arg("reps") ?? 10),
+        process.argv.includes("--text") || process.argv.includes("--e2e"),
+        process.argv.includes("--e2e"),
+      );
     default:
       console.log("사용법: node --env-file=.env scripts/tts-spike.ts <mode>");
       console.log("  moderation | voices | samples | assigned | latency | baseline");
       console.log("  옵션: --reps N  --voices id1,id2  --limit N(배역별 후보 수)");
-      console.log("  baseline --text 는 output_modalities:[\"text\"] 경로를 잰다.");
+      console.log("  baseline --text 는 텍스트 출력 경로를, --e2e 는 첫 소리까지 종단으로 잰다.");
       console.log("\n권장 순서: moderation → voices → samples(청취) → latency");
       console.log("baseline은 TYPECAST_API_KEY 없이도 돌아간다.");
       process.exitCode = 1;
