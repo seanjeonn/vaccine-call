@@ -5,6 +5,13 @@ import { SCENARIO_VOICES, typecastRequest } from "@/lib/tts-voices";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+// 동시 요청 한도에 걸렸을 때의 재시도. 한도는 낮지만(실측 Free 2) 스트림이 410~762ms에
+// 끝나므로 잠깐 기다리면 자리가 난다. 재시도가 없으면 429가 곧 문장 하나의 무음이 된다 —
+// 자막에는 남고 소리만 사라지므로 알아채기도 어렵다.
+const RETRY_DELAYS_MS = [200, 500];
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 // 훈련 통화(F1)의 사기범 대사 한 조각을 Typecast로 합성해 그대로 흘려보낸다.
 //
 // 프록시인 이유: Typecast는 X-API-KEY 헤더 인증뿐이고 브라우저용 단일 사용 토큰이 없다.
@@ -37,30 +44,50 @@ export async function POST(req: NextRequest) {
   // voice는 시나리오 id로만 고른다. 클라이언트가 임의 목소리를 지정할 수 없어야 한다.
   const spec = SCENARIO_VOICES[getScenario(body.scenarioId).id];
 
-  try {
-    const upstream = await fetch("https://api.typecast.ai/v1/text-to-speech/stream", {
-      method: "POST",
-      headers: { "X-API-KEY": key, "Content-Type": "application/json" },
-      body: JSON.stringify(typecastRequest(spec, text, { previous: body.previous, next: body.next })),
-      signal: req.signal,
-    });
+  const payload = JSON.stringify(typecastRequest(spec, text, { previous: body.previous, next: body.next }));
 
-    if (!upstream.ok || !upstream.body) {
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const upstream = await fetch("https://api.typecast.ai/v1/text-to-speech/stream", {
+        method: "POST",
+        headers: { "X-API-KEY": key, "Content-Type": "application/json" },
+        body: payload,
+        signal: req.signal,
+      });
+
+      if (upstream.ok && upstream.body) {
+        return new Response(upstream.body, {
+          headers: {
+            "Content-Type": "audio/wav",
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+
       const detail = await upstream.text().catch(() => "");
+      const retryable = upstream.status === 429 || upstream.status >= 500;
+      if (retryable && attempt < RETRY_DELAYS_MS.length && !req.signal.aborted) {
+        await sleep(RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+
       console.error("[voice] typecast", upstream.status, detail.slice(0, 300));
       return NextResponse.json({ error: `음성 합성 실패 (${upstream.status})` }, { status: 502 });
     }
-
-    return new Response(upstream.body, {
-      headers: {
-        "Content-Type": "audio/wav",
-        "Cache-Control": "no-store",
-      },
-    });
   } catch (err) {
     // 끼어들기로 클라이언트가 요청을 끊으면 여기로 온다. 오류가 아니다.
     if (req.signal.aborted) return new Response(null, { status: 499 });
     console.error("[voice] error", err);
     return NextResponse.json({ error: "음성 합성 실패" }, { status: 500 });
   }
+}
+
+// 통화를 시작하기 전에 이 경로를 쓸 수 있는지 묻는다. 키가 없으면 통화 페이지가
+// realtime으로 되돌아간다 — 배포 환경에 키를 넣지 않은 경우가 가장 흔한 실패다.
+// 합성을 하지 않으므로 크레딧을 쓰지 않는다.
+export async function GET() {
+  return NextResponse.json(
+    { ready: Boolean(process.env.TYPECAST_API_KEY) },
+    { headers: { "Cache-Control": "no-store" } },
+  );
 }

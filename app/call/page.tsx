@@ -495,7 +495,20 @@ export default function Home() {
 
       // 목소리를 어디서 만들지는 통화마다 한 번만 정한다. URL 쿼리가 최우선이라
       // 데모 중에도 /call?pipeline=realtime 으로 즉시 되돌릴 수 있다.
-      const pipeline = resolvePipeline(new URLSearchParams(window.location.search));
+      let pipeline = resolvePipeline(new URLSearchParams(window.location.search));
+      // 배포 환경에 Typecast 키를 넣지 않았으면 통화가 통째로 죽는다. 시작 전에 물어보고
+      // 안 되면 realtime으로 되돌린다. 합성하지 않는 확인이라 크레딧을 쓰지 않는다.
+      if (pipeline === "typecast") {
+        const ready = await fetch("/api/voice")
+          .then((r) => (r.ok ? (r.json() as Promise<{ ready?: boolean }>) : null))
+          .then((b) => Boolean(b?.ready))
+          .catch(() => false);
+        if (!ready) {
+          console.warn("[voice] Typecast를 쓸 수 없어 realtime으로 통화합니다.");
+          pipeline = "realtime";
+        }
+      }
+      if (!callActiveRef.current) return;
       pipelineRef.current = pipeline;
 
       // 외부 TTS 경로는 원격 오디오 트랙이 오지 않는다. 재생 경로를 우리가 세운다.

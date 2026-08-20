@@ -21,8 +21,14 @@ import { chunkEnd } from "@/lib/tts-chunk";
 const JITTER_MS = 90;
 // 이만큼 모이기 전에는 재생 노드를 만들지 않는다. 너무 잘게 쪼개면 노드만 늘어난다.
 const MIN_BLOCK_SAMPLES = TYPECAST_SAMPLE_RATE / 10; // 100ms
-// 동시에 띄워 둘 합성 요청 수. 재생 중인 조각의 다음 것을 미리 만들어 공백을 막는다.
-const PREFETCH = 2;
+// 동시에 띄워 둘 합성 요청 수.
+//
+// 1인 이유는 Typecast 동시 요청 한도 때문이다. 실측상 Free 티어는 2개를 넘기면 429가
+// 떨어지므로, 통화 하나가 2개를 쓰면 두 번째 사용자가 곧바로 막힌다.
+//
+// 1로 줄여도 조각 사이에 공백이 생기지 않는다. 스트림은 410~762ms에 끝나는데 그 오디오는
+// 2~5초짜리라, 다음 요청을 띄우고 첫 소리가 오기까지(~500ms) 여유가 1.6~4.4초 남는다.
+const PREFETCH = 1;
 
 export type VoicePlayback = {
   /** 새 응답 시작. 조각 번호와 버퍼를 되돌린다. */
