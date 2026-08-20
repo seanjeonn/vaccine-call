@@ -217,7 +217,7 @@ type Opts = {
   reps: number;
   turns: number;
   concurrency: number;
-  mode: "audio" | "text";
+  mode: "audio" | "text" | "audio-text";
   pace: boolean;
   judge: boolean;
   judgeOnly: string | null;
@@ -246,7 +246,7 @@ function parseArgs(argv: string[]): Opts {
     reps: Number(get("reps") ?? 3),
     turns: Number(get("turns") ?? 4),
     concurrency: Number(get("concurrency") ?? 3),
-    mode: (get("mode") ?? "audio") as "audio" | "text",
+    mode: (get("mode") ?? "audio") as "audio" | "text" | "audio-text",
     pace: get("pace") !== "0",
     judge: !has("no-judge"),
     judgeOnly: get("judge-only"),
@@ -329,7 +329,11 @@ type ServerEvent = {
   transcript?: string;
   text?: string;
   delta?: string;
-  session?: { instructions?: string; audio?: { output?: { voice?: string } } };
+  session?: {
+    instructions?: string;
+    output_modalities?: string[];
+    audio?: { output?: { voice?: string } };
+  };
   response?: {
     status?: string;
     usage?: {
@@ -514,13 +518,14 @@ async function runSample(
     await waiter.wait(["session.created"], 10000, "session.created");
 
     // WS는 세션 설정이 실려 오지 않는다. 라우트와 같은 설정을 올린다 (model은 URL에 있음).
-    const full = buildSessionConfig(scenario);
+    //
+    // audio-text는 프로덕션의 typecast 경로와 같다 — 오디오로 듣고 텍스트로 답한다.
+    // audio.input(전사·far_field·server_vad)이 그대로 남으므로 턴 분절까지 측정된다.
+    // 반면 text 모드는 audio 블록을 통째로 지워 VAD를 아예 태우지 않는다.
+    const full = buildSessionConfig(scenario, { textOut: opts.mode !== "audio" });
     const session: Record<string, unknown> = { ...full };
     delete session.model; // 모델은 URL 쿼리로 이미 고정
-    if (opts.mode === "text") {
-      session.output_modalities = ["text"];
-      delete session.audio;
-    }
+    if (opts.mode === "text") delete session.audio;
     send({ type: "session.update", session });
     const updated = await waiter.wait(["session.updated"], 10000, "session.updated");
 
@@ -531,6 +536,11 @@ async function runSample(
     }
     if (opts.mode === "audio" && echoed.audio?.output?.voice !== full.audio.output?.voice) {
       throw new Error("session_config_mismatch:voice");
+    }
+    // 텍스트 출력으로 안 넘어갔는데 계속 돌면 엉뚱한 경로를 측정하게 된다.
+    const wantModality = opts.mode === "audio" ? "audio" : "text";
+    if (echoed.output_modalities && echoed.output_modalities[0] !== wantModality) {
+      throw new Error("session_config_mismatch:output_modalities");
     }
 
     // 오프닝 — 프로덕션과 같은 방식(per-response instructions)
@@ -592,7 +602,7 @@ async function runSample(
 
       const scriptedTurn = result.turns.filter((t) => t.role === "user").at(-1);
       if (scriptedTurn) scriptedTurn.scripted = line.text;
-      if (opts.mode === "audio") {
+      if (opts.mode !== "text") {
         if (scriptedTurn) scriptedTurn.items = itemsThisLine;
         if (itemsThisLine > 1) result.fragmentation.splitLines++;
       }
@@ -709,7 +719,8 @@ function buildReport(samples: SampleResult[], opts: Opts, meta: Record<string, u
   L.push(
     `instructions sha: ${opts.scenarios.map((id) => `${id} ${sha(buildInstructions(SCENARIOS.find((s) => s.id === id)!)).slice(0, 8)}`).join(" / ")}`,
   );
-  if (opts.mode === "text") L.push(`\n> ⚠️ TEXT MODE — 오디오 경로 미검증. 게이트로 쓸 수 없다.`);
+  if (opts.mode === "text") L.push(`\n> ⚠️ TEXT MODE — VAD를 태우지 않는다. 프롬프트 반복 실험용이고 게이트로 쓸 수 없다.`);
+  if (opts.mode === "audio-text") L.push(`\n> AUDIO-TEXT MODE — 프로덕션의 typecast 경로와 같은 세션 설정이다.`);
 
   L.push(`\n## 요약`);
   if (judged.length) {
@@ -723,7 +734,7 @@ function buildReport(samples: SampleResult[], opts: Opts, meta: Record<string, u
   } else {
     L.push(`- (심판 미실행)`);
   }
-  if (opts.mode === "audio" && totalLines) {
+  if (opts.mode !== "text" && totalLines) {
     L.push(
       `- 턴 분절: ${(totalItems / totalLines).toFixed(2)} items/line (쪼개진 대사 ${splitLines}/${totalLines} = ${pct(splitLines / totalLines)})`,
     );
@@ -877,17 +888,21 @@ async function main() {
   }
 
   console.log(`\n계획: ${plan.length}샘플 (${opts.scenarios.join(",")} × ${opts.personas.join(",")} × ${opts.reps}회), ${opts.turns}턴, mode=${opts.mode}, 동시 ${opts.concurrency}`);
-  console.log(`추정 비용: $${(plan.length * (opts.mode === "audio" ? 0.08 : 0.015)).toFixed(2)} (오디오 기준 샘플당 ~$0.08)`);
+  // audio-text는 오디오 입력값은 그대로 내고 출력만 텍스트라 그 중간이다.
+  const perSample = opts.mode === "audio" ? 0.08 : opts.mode === "audio-text" ? 0.04 : 0.015;
+  console.log(`추정 비용: $${(plan.length * perSample).toFixed(2)} (샘플당 ~$${perSample})`);
   for (const s of scenarios) {
-    console.log(`  ${s.id}: instructions ${sha(buildInstructions(s)).slice(0, 12)} / voice ${buildSessionConfig(s).audio.output?.voice}`);
+    const voice = opts.mode === "audio" ? buildSessionConfig(s).audio.output?.voice : "(텍스트 출력)";
+    console.log(`  ${s.id}: instructions ${sha(buildInstructions(s)).slice(0, 12)} / voice ${voice}`);
   }
   if (opts.dryRun) {
     console.log(`\n--- 세션 설정 (${scenarios[0].id}) ---`);
-    console.log(JSON.stringify(buildSessionConfig(scenarios[0]), null, 2));
+    // 실제로 보낼 것과 같아야 한다. 모드를 빼고 찍으면 dry-run이 거짓말을 한다.
+    console.log(JSON.stringify(buildSessionConfig(scenarios[0], { textOut: opts.mode !== "audio" }), null, 2));
     console.log(`\n--- instructions (${scenarios[0].id}) ---\n${buildInstructions(scenarios[0])}`);
     return;
   }
-  if (!opts.yes && opts.mode === "audio" && plan.length > 3) {
+  if (!opts.yes && opts.mode !== "text" && plan.length > 3) {
     console.log(`\n계속하려면 --yes 를 붙여 다시 실행하세요.`);
     return;
   }
@@ -917,7 +932,7 @@ async function main() {
   writeFileSync(join(runDir, "config.json"), JSON.stringify(meta, null, 2));
 
   // 오디오는 미리 다 만들어 둔다. 캐시 미스가 통화 중 지연으로 새지 않게.
-  if (opts.mode === "audio") {
+  if (opts.mode !== "text") {
     const lines = [...new Set(plan.flatMap((p) => SCRIPTS[p.scenario.id][p.persona].slice(0, opts.turns).map((l: Line) => l.text)))];
     await pool(lines, 4, (text) => pcmForLine(text).then(() => undefined));
   }
