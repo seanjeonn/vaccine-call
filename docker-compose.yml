@@ -1,0 +1,26 @@
+# 로컬 개발용 Postgres. 배포는 Neon을 쓰므로 이 컨테이너는 개발·테스트 전용이다.
+#   docker compose up -d   → localhost:5432
+# 접속 정보는 .env의 DATABASE_URL / DATABASE_URL_UNPOOLED와 맞춰야 한다.
+
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: vaccine-call-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vaccinecall
+      POSTGRES_PASSWORD: vaccinecall
+      POSTGRES_DB: vaccinecall
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 마이그레이션이 준비되지 않은 DB에 붙지 않도록 기동 완료를 기다린다.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaccinecall -d vaccinecall"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
