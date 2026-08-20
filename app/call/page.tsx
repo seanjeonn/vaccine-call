@@ -3,6 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { randomScenario, type Scenario } from "@/lib/scenarios";
 import { openingResponseInstructions } from "@/lib/realtime-session";
+import {
+  applyTelephoneLine,
+  TELEPHONE_LINE_ENABLED,
+  type TelephoneLine,
+} from "@/lib/telephone-audio";
 import type { TrainingReport } from "@/lib/report";
 import TrainingReportView from "@/components/training-report";
 import InterventionScreen, { type Interruption } from "@/components/intervention-screen";
@@ -46,15 +51,18 @@ export default function Home() {
 
   const streamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // 전화선 체인에 넣을 원본 스트림을 붙여두는 곳. 소리는 audioRef가 낸다.
+  const rawAudioRef = useRef<HTMLAudioElement | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null); // 연결음 전용
+  const audioCtxRef = useRef<AudioContext | null>(null); // 연결음 + 전화선 체인
   const callActiveRef = useRef(false);
   const entriesRef = useRef<Entry[]>([]);
   const messagesRef = useRef<Message[]>([]);
   const ringbackRef = useRef<{ stop: () => void } | null>(null);
+  const telephoneRef = useRef<TelephoneLine | null>(null);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
@@ -155,6 +163,13 @@ export default function Home() {
       audioRef.current.pause();
       audioRef.current.srcObject = null;
     }
+    if (rawAudioRef.current) {
+      rawAudioRef.current.pause();
+      rawAudioRef.current.srcObject = null;
+    }
+    // 오디오 컨텍스트를 닫기 전에 체인을 끊는다.
+    telephoneRef.current?.stop();
+    telephoneRef.current = null;
     if (audioCtxRef.current) {
       audioCtxRef.current.close().catch(() => {});
       audioCtxRef.current = null;
@@ -414,7 +429,24 @@ export default function Home() {
       pc.ontrack = (e) => {
         const el = audioRef.current;
         if (!el) return;
-        el.srcObject = e.streams[0];
+        // 전화선 체인을 통과시켜 재생한다. 필터를 걸어도 재생은 <audio>가 계속 맡아야
+        // 브라우저 AEC가 이 소리를 참조 신호로 잡는다. (직접 destination으로 보내면
+        // 사기꾼 목소리가 마이크로 되돌아가 서버 VAD가 사용자 발화로 오인한다)
+        const ctx = audioCtxRef.current;
+        const raw = rawAudioRef.current;
+        if (TELEPHONE_LINE_ENABLED && ctx && raw) {
+          // 크롬은 원격 스트림이 미디어 엘리먼트에 붙어 있어야 오디오를 실제로 흘려보낸다.
+          // 붙이지 않으면 createMediaStreamSource가 무음만 낸다. 들리는 소리는 필터를 통과한
+          // 쪽이어야 하므로 원본은 음소거로 붙여만 둔다.
+          raw.muted = true; // 리액트가 muted 속성을 놓쳐도 원본이 새어나오지 않게 한다
+          raw.srcObject = e.streams[0];
+          raw.play().catch(() => {});
+          telephoneRef.current?.stop();
+          telephoneRef.current = applyTelephoneLine(ctx, e.streams[0]);
+          el.srcObject = telephoneRef.current.stream;
+        } else {
+          el.srcObject = e.streams[0];
+        }
         el.play().catch(() => {});
       };
       pc.onconnectionstatechange = () => {
@@ -678,6 +710,7 @@ export default function Home() {
 
       {/* 사기꾼 음성(원격 트랙) 재생용 */}
       <audio ref={audioRef} autoPlay className="hidden" />
+      <audio ref={rawAudioRef} autoPlay muted className="hidden" />
 
       {error && (
         <p className="w-full max-w-[520px] rounded bg-red-500/15 px-3 py-2 text-sm text-red-300">
