@@ -53,3 +53,7 @@ skills-lock.json
 # eval harness
 eval-runs/
 .eval-cache/
+
+# TTS 프로바이더 스파이크 산출물 (Phase 0). 청취용 임시 파일이라 추적하지 않는다.
+spike-out/
+public/spike/

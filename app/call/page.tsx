@@ -5,9 +5,13 @@ import { randomScenario, type Scenario } from "@/lib/scenarios";
 import { openingResponseInstructions } from "@/lib/realtime-session";
 import {
   applyTelephoneLine,
+  buildTelephoneChain,
   TELEPHONE_LINE_ENABLED,
+  type TelephoneChain,
   type TelephoneLine,
 } from "@/lib/telephone-audio";
+import { resolvePipeline, type VoicePipeline } from "@/lib/voice-pipeline";
+import { createVoicePlayback, type VoicePlayback } from "@/lib/tts-playback";
 import type { TrainingReport } from "@/lib/report";
 import TrainingReportView from "@/components/training-report";
 import InterventionScreen, { type Interruption } from "@/components/intervention-screen";
@@ -28,8 +32,9 @@ type ServerEvent = {
   item?: { id?: string; type?: string; role?: string };
   item_id?: string;
   transcript?: string;
+  text?: string;
   delta?: string;
-  error?: unknown;
+  error?: { code?: string; message?: string };
 };
 
 export default function Home() {
@@ -63,6 +68,15 @@ export default function Home() {
   const messagesRef = useRef<Message[]>([]);
   const ringbackRef = useRef<{ stop: () => void } | null>(null);
   const telephoneRef = useRef<TelephoneLine | null>(null);
+
+  // 목소리를 어디서 만들지. 통화 시작 시점에 정해지고 통화 중에는 바뀌지 않는다.
+  const pipelineRef = useRef<VoicePipeline>("realtime");
+  const playbackRef = useRef<VoicePlayback | null>(null);
+  const chainRef = useRef<TelephoneChain | null>(null);
+  // 진행 중인 응답이 없을 때 response.cancel을 보내면 서버가 error를 던진다.
+  const responseActiveRef = useRef(false);
+  // 끼어들기로 자막을 줄일 때 어느 항목을 줄일지.
+  const speakingItemRef = useRef<string | null>(null);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
@@ -168,8 +182,14 @@ export default function Home() {
       rawAudioRef.current.srcObject = null;
     }
     // 오디오 컨텍스트를 닫기 전에 체인을 끊는다.
+    playbackRef.current?.dispose();
+    playbackRef.current = null;
     telephoneRef.current?.stop();
     telephoneRef.current = null;
+    chainRef.current?.stop();
+    chainRef.current = null;
+    responseActiveRef.current = false;
+    speakingItemRef.current = null;
     if (audioCtxRef.current) {
       audioCtxRef.current.close().catch(() => {});
       audioCtxRef.current = null;
@@ -296,9 +316,37 @@ export default function Home() {
     if (callActiveRef.current) setStatus("speaking");
   }, []);
 
+  // 끼어들기. realtime 경로에서는 서버가 응답 취소와 재생 절단을 모두 해주지만,
+  // 텍스트 출력에서는 서버에 오디오 버퍼가 없어 우리가 끊어야 한다.
+  //
+  // 자막도 함께 줄인다. 텍스트는 소리보다 먼저 도착하므로, 그냥 두면 사기범이 실제로
+  // 말한 적 없는 문장이 화면과 저장된 대화에 남는다. 리포트의 인용과 guard가 그 문자열을
+  // 읽기 때문에 이건 표시 문제가 아니다.
+  const bargeIn = useCallback(() => {
+    if (pipelineRef.current !== "typecast") return;
+
+    if (responseActiveRef.current) {
+      dcRef.current?.send(JSON.stringify({ type: "response.cancel" }));
+      responseActiveRef.current = false;
+    }
+
+    const playback = playbackRef.current;
+    const itemId = speakingItemRef.current;
+    if (playback && itemId) {
+      const spoken = playback.playedChars();
+      const entry = entriesRef.current.find((e) => e.id === itemId);
+      if (entry && entry.content.length > spoken) {
+        entry.content = entry.content.slice(0, spoken).trimEnd();
+        syncTranscript();
+      }
+    }
+    playback?.cancel();
+    speakingItemRef.current = null;
+  }, [syncTranscript]);
+
   // 데이터 채널로 오는 서버 이벤트를 화면 상태로 옮긴다.
-  // 끼어들기는 서버 VAD가 처리한다. 사용자가 말을 시작하면 진행 중이던 응답이 서버에서
-  // 취소·절단되고, 잘린 자막은 transcript.done이 최종본으로 덮어 바로잡는다.
+  // realtime 경로에서 끼어들기는 서버 VAD가 처리한다. 사용자가 말을 시작하면 진행 중이던
+  // 응답이 서버에서 취소·절단되고, 잘린 자막은 transcript.done이 최종본으로 덮어 바로잡는다.
   const handleServerEvent = useCallback(
     (raw: string) => {
       let ev: ServerEvent;
@@ -342,28 +390,65 @@ export default function Home() {
           syncTranscript();
           break;
         }
+        // 텍스트 출력 경로. 자막은 여기서 채우고, 같은 델타를 재생 큐로 흘린다.
+        // 연결음은 여기서 끊지 않는다 — 텍스트는 소리보다 한참 먼저 온다.
+        case "response.output_text.delta": {
+          if (!ev.item_id || !ev.delta) break;
+          speakingItemRef.current = ev.item_id;
+          writeEntry(ev.item_id, "assistant", ev.delta, "append");
+          syncTranscript();
+          playbackRef.current?.push(ev.delta);
+          break;
+        }
+        case "response.output_text.done": {
+          if (!ev.item_id) break;
+          writeEntry(ev.item_id, "assistant", ev.text ?? "", "set");
+          syncTranscript();
+          playbackRef.current?.end();
+          break;
+        }
         // 사기꾼 목소리가 실제로 나오기 시작하는 순간. 연결음은 여기서 끊는다.
+        // 텍스트 출력에서는 이 이벤트가 오지 않으므로 재생 큐가 같은 일을 한다.
         case "output_audio_buffer.started": {
           startSpeaking();
           break;
         }
-        // 사용자가 말을 시작했다. 사기꾼이 말하는 도중이면 끼어들기이고,
-        // 서버가 진행 중인 응답을 끊는다. (WebRTC라 재생 버퍼는 서버가 정리한다)
-        case "input_audio_buffer.speech_started":
-        // 응답이 끝났거나(response.done) 재생이 멈췄다. 어느 쪽이 와도 청취 상태로 돌린다.
-        case "response.done":
+        case "response.created": {
+          responseActiveRef.current = true;
+          // 조각 번호와 재생 차례를 되돌린다. 응답마다 0번부터 다시 세야 순서가 맞다.
+          playbackRef.current?.begin();
+          break;
+        }
+        // 사용자가 말을 시작했다. 사기꾼이 말하는 도중이면 끼어들기다.
+        case "input_audio_buffer.speech_started": {
+          bargeIn();
+          if (callActiveRef.current) setStatus("listening");
+          break;
+        }
+        // 응답이 끝났거나 재생이 멈췄다.
+        case "response.done": {
+          responseActiveRef.current = false;
+          // 텍스트 출력에서는 생성이 끝나도 소리는 아직 남아 있다. 상태는 재생 큐가 비면
+          // 그때 되돌린다. 여기서 되돌리면 사기꾼이 말하는 중에 "듣는 중"으로 바뀐다.
+          if (pipelineRef.current === "typecast") break;
+          if (callActiveRef.current) setStatus("listening");
+          break;
+        }
         case "output_audio_buffer.stopped":
         case "output_audio_buffer.cleared": {
           if (callActiveRef.current) setStatus("listening");
           break;
         }
         case "error": {
+          // 취소가 서버에 닿기 전에 응답이 스스로 끝나면 이 코드가 온다. 플래그로는 못 막는
+          // 경합이고, 애초에 원하던 결과(진행 중인 응답 없음)라 조용히 넘긴다.
+          if (ev.error?.code === "response_cancel_not_active") break;
           console.error("[realtime]", ev.error);
           break;
         }
       }
     },
-    [upsertEntry, writeEntry, syncTranscript, checkGuard, startSpeaking],
+    [upsertEntry, writeEntry, syncTranscript, checkGuard, startSpeaking, bargeIn],
   );
 
   // 통화 시작: 시나리오 배정 → 마이크 확보 → Realtime 세션 발급 → WebRTC 연결 → 오프닝.
@@ -408,11 +493,46 @@ export default function Home() {
       scenarioRef.current = picked;
       setScenario(picked);
 
+      // 목소리를 어디서 만들지는 통화마다 한 번만 정한다. URL 쿼리가 최우선이라
+      // 데모 중에도 /call?pipeline=realtime 으로 즉시 되돌릴 수 있다.
+      const pipeline = resolvePipeline(new URLSearchParams(window.location.search));
+      pipelineRef.current = pipeline;
+
+      // 외부 TTS 경로는 원격 오디오 트랙이 오지 않는다. 재생 경로를 우리가 세운다.
+      // 반드시 MediaStreamDestination → <audio>로 끝내야 한다. ctx.destination으로
+      // 직결하면 브라우저 AEC의 참조 신호에서 빠져, 사기꾼 목소리가 마이크로 되돌아가고
+      // 서버 VAD가 그것을 사용자 발화로 오인해 통화가 스스로 끊긴다.
+      if (pipeline === "typecast") {
+        const el = audioRef.current;
+        const sink = ctx.createMediaStreamDestination();
+        let entry: AudioNode = sink;
+        if (TELEPHONE_LINE_ENABLED) {
+          const chain = buildTelephoneChain(ctx);
+          chain.output.connect(sink);
+          chainRef.current = chain;
+          entry = chain.input;
+        }
+        if (el) {
+          el.srcObject = sink.stream;
+          el.play().catch(() => {});
+        }
+        playbackRef.current = createVoicePlayback({
+          ctx,
+          destination: entry,
+          scenarioId: picked.id,
+          onFirstAudio: startSpeaking,
+          onDrain: () => {
+            if (callActiveRef.current) setStatus("listening");
+          },
+          onError: (err) => console.error("[voice]", err),
+        });
+      }
+
       // 임시 키 발급. 시나리오 프롬프트·목소리는 서버가 세션에 심는다.
       const keyRes = await fetch("/api/realtime", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ scenario: picked }),
+        body: JSON.stringify({ scenario: picked, pipeline }),
       });
       const keyBody = (await keyRes.json().catch(() => null)) as {
         value?: string;
@@ -427,6 +547,8 @@ export default function Home() {
       pcRef.current = pc;
       pc.addTrack(stream.getAudioTracks()[0], stream);
       pc.ontrack = (e) => {
+        // 텍스트 출력에서는 원격 트랙이 오지 않는다. 와도 우리 재생 경로를 덮으면 안 된다.
+        if (pipelineRef.current === "typecast") return;
         const el = audioRef.current;
         if (!el) return;
         // 전화선 체인을 통과시켜 재생한다. 필터를 걸어도 재생은 <audio>가 계속 맡아야
@@ -502,6 +624,7 @@ export default function Home() {
     }
   }, [
     startRingback,
+    startSpeaking,
     handleServerEvent,
     syncTranscript,
     endCall,

@@ -10,8 +10,14 @@ export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
-    const { scenario } = (await req.json()) as { scenario?: unknown };
-    const session = buildSessionConfig(resolveScenario(scenario));
+    const { scenario, pipeline } = (await req.json()) as {
+      scenario?: unknown;
+      pipeline?: string;
+    };
+    // 외부 TTS 경로에서는 모델이 텍스트만 낸다. 목소리는 /api/voice가 만든다.
+    const session = buildSessionConfig(resolveScenario(scenario), {
+      textOut: pipeline === "typecast",
+    });
 
     const res = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
       method: "POST",

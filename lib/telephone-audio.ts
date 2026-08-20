@@ -24,6 +24,13 @@ export type TelephoneLine = {
   stop: () => void;
 };
 
+// 체인의 양 끝. 입력이 MediaStream이 아닌 경우(파일 재생, 합성 PCM)에도 같은 체인을 쓴다.
+export type TelephoneChain = {
+  input: AudioNode;
+  output: AudioNode;
+  stop: () => void;
+};
+
 // G.711 µ-law 압신 + 8비트 양자화를 그대로 되돌린 곡선. WaveShaper는 메모리 없는 매핑이라
 // 이 표 하나로 실제 µ-law 왕복과 같은 계단 잡음이 생긴다.
 function muLawCurve(points: number) {
@@ -43,7 +50,7 @@ function muLawCurve(points: number) {
   return curve;
 }
 
-function createLineNoise(ctx: AudioContext): AudioBufferSourceNode {
+function createLineNoise(ctx: BaseAudioContext): AudioBufferSourceNode {
   const length = Math.floor(ctx.sampleRate * NOISE_LOOP_SECONDS);
   const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
   const channel = buffer.getChannelData(0);
@@ -54,10 +61,8 @@ function createLineNoise(ctx: AudioContext): AudioBufferSourceNode {
   return source;
 }
 
-// 원격 오디오 스트림에 전화선 체인을 걸어 재생용 스트림을 돌려준다.
-export function applyTelephoneLine(ctx: AudioContext, source: MediaStream): TelephoneLine {
-  const input = ctx.createMediaStreamSource(source);
-
+// 전화선 체인을 노드 쌍으로 만든다. 무엇을 물릴지는 호출자가 정한다.
+export function buildTelephoneChain(ctx: BaseAudioContext): TelephoneChain {
   const highpass = ctx.createBiquadFilter();
   highpass.type = "highpass";
   highpass.frequency.value = BAND_LOW_HZ;
@@ -90,17 +95,18 @@ export function applyTelephoneLine(ctx: AudioContext, source: MediaStream): Tele
   const trim = ctx.createGain();
   trim.gain.value = 0.85;
 
-  const destination = ctx.createMediaStreamDestination();
+  // 목소리와 회선 잡음이 합류하는 지점. 체인의 출구다.
+  const mix = ctx.createGain();
 
-  input.connect(highpass);
   highpass.connect(lowpass);
   lowpass.connect(presence);
   presence.connect(compressor);
   compressor.connect(codec);
   codec.connect(trim);
-  trim.connect(destination);
+  trim.connect(mix);
 
   // 회선 잡음도 같은 대역으로 잘라서 섞는다. 밖에서 만든 소음 에셋을 받지 않는다.
+  // 잡음은 코덱 앞이 아니라 출력에 바로 붙는다. 목소리와 함께 압축되면 안 된다.
   const noise = createLineNoise(ctx);
   const noiseHighpass = ctx.createBiquadFilter();
   noiseHighpass.type = "highpass";
@@ -114,11 +120,12 @@ export function applyTelephoneLine(ctx: AudioContext, source: MediaStream): Tele
   noise.connect(noiseHighpass);
   noiseHighpass.connect(noiseLowpass);
   noiseLowpass.connect(noiseGain);
-  noiseGain.connect(destination);
+  noiseGain.connect(mix);
   noise.start();
 
   return {
-    stream: destination.stream,
+    input: highpass,
+    output: mix,
     stop: () => {
       try {
         noise.stop();
@@ -126,13 +133,13 @@ export function applyTelephoneLine(ctx: AudioContext, source: MediaStream): Tele
         // 이미 멈춘 경우
       }
       for (const node of [
-        input,
         highpass,
         lowpass,
         presence,
         compressor,
         codec,
         trim,
+        mix,
         noise,
         noiseHighpass,
         noiseLowpass,
@@ -140,6 +147,24 @@ export function applyTelephoneLine(ctx: AudioContext, source: MediaStream): Tele
       ]) {
         node.disconnect();
       }
+    },
+  };
+}
+
+// 원격 오디오 스트림에 전화선 체인을 걸어 재생용 스트림을 돌려준다.
+export function applyTelephoneLine(ctx: AudioContext, source: MediaStream): TelephoneLine {
+  const input = ctx.createMediaStreamSource(source);
+  const chain = buildTelephoneChain(ctx);
+  const destination = ctx.createMediaStreamDestination();
+
+  input.connect(chain.input);
+  chain.output.connect(destination);
+
+  return {
+    stream: destination.stream,
+    stop: () => {
+      chain.stop();
+      input.disconnect();
     },
   };
 }
