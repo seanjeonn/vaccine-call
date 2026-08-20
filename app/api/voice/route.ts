@@ -20,10 +20,14 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function failureCause(err: unknown): string {
   if (!(err instanceof Error)) return "unknown";
   const cause = (err as { cause?: unknown }).cause as
-    | { code?: string; errors?: Array<{ code?: string }> }
+    | { code?: string; message?: string; errors?: Array<{ code?: string }> }
     | undefined;
   // 연결 실패는 AggregateError로 한 겹 더 감싸여 온다. 코드는 그 안에 있다.
-  return cause?.code ?? cause?.errors?.find((e) => e?.code)?.code ?? err.name ?? "unknown";
+  const code = cause?.code ?? cause?.errors?.find((e) => e?.code)?.code;
+  if (code) return code;
+  // 코드가 없는 경우가 있다. 그때는 원인 객체의 메시지가 유일한 단서다.
+  // ("fetch failed"인 바깥 메시지는 쓸모가 없어 안쪽을 본다)
+  return (cause?.message ?? err.message ?? err.name ?? "unknown").slice(0, 120);
 }
 
 // 훈련 통화(F1)의 사기범 대사 한 조각을 Typecast로 합성해 그대로 흘려보낸다.
@@ -60,14 +64,29 @@ export async function POST(req: NextRequest) {
 
   const payload = JSON.stringify(typecastRequest(spec, text, { previous: body.previous, next: body.next }));
 
+  // 끼어들기로 클라이언트가 끊으면 진행 중인 합성도 같이 끊고 싶어 요청 신호를 넘긴다.
+  // 다만 런타임에 따라 이 신호를 fetch에 넘기는 것만으로 TypeError가 나는 경우가 있어,
+  // 그때는 신호 없이 한 번 더 시도한다. 크레딧이 조금 새더라도 통화가 죽는 것보다 낫다.
+  let useSignal = true;
+  const call = () =>
+    fetch("https://api.typecast.ai/v1/text-to-speech/stream", {
+      method: "POST",
+      headers: { "X-API-KEY": key, "Content-Type": "application/json" },
+      body: payload,
+      ...(useSignal ? { signal: req.signal } : {}),
+    });
+
   try {
     for (let attempt = 0; ; attempt++) {
-      const upstream = await fetch("https://api.typecast.ai/v1/text-to-speech/stream", {
-        method: "POST",
-        headers: { "X-API-KEY": key, "Content-Type": "application/json" },
-        body: payload,
-        signal: req.signal,
-      });
+      let upstream: Response;
+      try {
+        upstream = await call();
+      } catch (err) {
+        if (!useSignal || req.signal.aborted) throw err;
+        console.error("[voice] 요청 신호를 넘기지 못했습니다. 신호 없이 재시도합니다.", failureCause(err));
+        useSignal = false;
+        upstream = await call();
+      }
 
       if (upstream.ok && upstream.body) {
         return new Response(upstream.body, {
