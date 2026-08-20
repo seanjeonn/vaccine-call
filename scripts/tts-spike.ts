@@ -1,19 +1,17 @@
-// TTS 프로바이더 검증 스파이크 (Phase 0). 앱 코드는 건드리지 않는다.
+// Typecast TTS 검증 스파이크 (Phase 0).
 //
-// 훈련 통화(F1)의 목소리를 gpt-realtime에서 외부 TTS로 옮길지 판단하기 위한 측정 도구다.
-// 판단 근거가 되는 네 가지를 각각 따로 잰다. 순서가 중요하다 — moderation이 막히면
-// 나머지를 잴 이유가 없고, voices/samples는 그다음, latency는 마지막이다.
+// 훈련 통화(F1)의 목소리를 gpt-realtime에서 Typecast로 옮길지 판단하기 위한 측정 도구다.
+// 판단 근거를 각각 따로 잰다. 순서가 중요하다 — moderation이 막히면 나머지를 잴 이유가 없다.
 //
-//   moderation  사기범 대사를 프로바이더가 합성해 주는가          (막히면 전면 중단)
-//   voices      한국어 voice 후보 목록                            (samples의 입력)
+//   moderation  사기범 대사를 합성해 주는가                (막히면 전면 중단)
+//   voices      한국어 voice 후보 목록                      (samples의 입력)
 //   samples     후보별 시나리오 대사 합성 → 블라인드 청취용 파일
 //   latency     첫 오디오 바이트까지의 지연 (TTFB)
 //   baseline    현행 Realtime의 발화 종료 → 첫 소리 지연
 //
-// baseline은 OPENAI_API_KEY만 있으면 돌아간다. 나머지는 ELEVENLABS_API_KEY /
-// TYPECAST_API_KEY가 필요하고, 키가 있는 프로바이더만 자동으로 대상에 들어간다.
+// baseline은 OPENAI_API_KEY만 쓴다. 나머지는 TYPECAST_API_KEY가 필요하다.
 //
-// 사용법: node --env-file=.env scripts/tts-spike.ts <mode> [--reps 20] [--provider eleven]
+// 사용법: node --env-file=.env scripts/tts-spike.ts <mode> [--reps 20] [--voices id1,id2]
 //
 // 청취는 파일을 직접 듣지 말고 npm run dev 후 /spike/listen 에서 한다. 그 페이지가
 // lib/telephone-audio.ts의 실제 체인을 통과시킨다. 협대역으로 깎이기 전 소리를 비교하면
@@ -36,11 +34,10 @@ const BYTES_PER_SEC = 24000 * 2; // 16bit mono
 const FRAME_MS = 40;
 const FRAME_BYTES = (BYTES_PER_SEC * FRAME_MS) / 1000; // 1920
 
-const ELEVEN_KEY = process.env.ELEVENLABS_API_KEY;
 const TYPECAST_KEY = process.env.TYPECAST_API_KEY;
-
-const ELEVEN_MODEL = "eleven_flash_v2_5";
 const TYPECAST_MODEL = "ssfm-v30";
+// 스트리밍 응답 포맷. 첫 청크에 44바이트 WAV 헤더가 붙고 이후는 raw PCM이다.
+const TYPECAST_RATE = 32000;
 
 // --- 대사 -----------------------------------------------------------------
 
@@ -63,70 +60,27 @@ function spikeLines(): SpikeLine[] {
   ]);
 }
 
-// --- 프로바이더별 톤 파라미터 ------------------------------------------------
+// --- 배역별 톤 파라미터 ------------------------------------------------------
 
 // 시작점일 뿐이다. Phase 0 청취 결과로 조정한다. 근거는 lib/scenarios.ts의 ttsInstructions.
-const ELEVEN_SETTINGS: Record<ScenarioId, Record<string, number | boolean>> = {
-  // 감정 없는 사무적 수사관 — stability를 올려 표현력을 죽인다.
-  institution: { stability: 0.65, similarity_boost: 0.8, style: 0.15, use_speaker_boost: true, speed: 0.96 },
-  // 무너지는 아들 — stability를 내려 흔들림을 허용한다. 낮을수록 한국어 아티팩트 위험이 커진다.
-  family: { stability: 0.3, similarity_boost: 0.75, style: 0.55, speed: 1.08 },
-  loan: { stability: 0.55, similarity_boost: 0.85, style: 0.3, speed: 1.1 },
+// 프리셋 7종(normal/happy/sad/angry/whisper/toneup/tonedown)에 "당황·다급"이 없다.
+// family는 sad를 세게 건 것이 최근사고, 느린 슬픔으로 들리면 toneup으로 바꿔 본다.
+// intensity는 0.0~2.0, 기본 1.0.
+const PROMPTS: Record<ScenarioId, { emotion: string; intensity: number; pitch: number; tempo: number }> = {
+  institution: { emotion: "tonedown", intensity: 1.2, pitch: -2, tempo: 0.95 }, // 감정 없는 사무적 수사관
+  family: { emotion: "sad", intensity: 1.6, pitch: 1, tempo: 1.12 }, // 숨차고 울먹이는 아들
+  loan: { emotion: "happy", intensity: 1.1, pitch: 0, tempo: 1.12 }, // 매끄럽고 빠른 영업 말투
 };
 
-// Typecast 7종 프리셋에 "당황/다급"이 없다. family는 sad + 빠른 tempo가 최근사다.
-const TYPECAST_PROMPT: Record<ScenarioId, { emotion: string; pitch: number; tempo: number }> = {
-  institution: { emotion: "tonedown", pitch: -2, tempo: 0.95 },
-  family: { emotion: "sad", pitch: 1, tempo: 1.12 },
-  loan: { emotion: "happy", pitch: 0, tempo: 1.12 },
-};
+// --- Typecast 호출 -----------------------------------------------------------
 
-// --- 프로바이더 호출 --------------------------------------------------------
+// ttfb는 첫 바이트, ttfa는 44바이트 WAV 헤더를 넘어선 첫 오디오 바이트까지의 시간이다.
+// Typecast는 헤더를 합성 전에 먼저 흘려보내므로 ttfb만 보면 실제보다 빠르게 보인다.
+type Synth = { audio: Buffer; ttfbMs: number; ttfaMs: number };
 
-type Synth = { audio: Buffer; sampleRate: number; ttfbMs: number };
-
-/** 응답 본문의 첫 바이트가 도착한 시각을 재면서 전부 모은다. */
-async function drain(res: Response, startedAt: number): Promise<{ body: Buffer; ttfbMs: number }> {
-  if (!res.body) throw new Error("응답 본문이 없습니다.");
-  const reader = res.body.getReader();
-  const chunks: Buffer[] = [];
-  let ttfbMs = -1;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    if (value?.length) {
-      if (ttfbMs < 0) ttfbMs = performance.now() - startedAt;
-      chunks.push(Buffer.from(value));
-    }
-  }
-  return { body: Buffer.concat(chunks), ttfbMs: ttfbMs < 0 ? performance.now() - startedAt : ttfbMs };
-}
-
-async function elevenSynth(voiceId: string, text: string, scenario: ScenarioId): Promise<Synth> {
-  if (!ELEVEN_KEY) throw new Error("ELEVENLABS_API_KEY가 없습니다.");
-  const url =
-    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream` +
-    `?output_format=pcm_24000&optimize_streaming_latency=3`;
-  const { speed, ...voiceSettings } = ELEVEN_SETTINGS[scenario];
-  const startedAt = performance.now();
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "xi-api-key": ELEVEN_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text,
-      model_id: ELEVEN_MODEL,
-      language_code: "ko",
-      voice_settings: { ...voiceSettings, speed },
-    }),
-  });
-  if (!res.ok) throw new Error(`eleven ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const { body, ttfbMs } = await drain(res, startedAt);
-  return { audio: body, sampleRate: 24000, ttfbMs };
-}
-
-async function typecastSynth(voiceId: string, text: string, scenario: ScenarioId): Promise<Synth> {
+async function synth(voiceId: string, text: string, scenario: ScenarioId): Promise<Synth> {
   if (!TYPECAST_KEY) throw new Error("TYPECAST_API_KEY가 없습니다.");
-  const p = TYPECAST_PROMPT[scenario];
+  const p = PROMPTS[scenario];
   const startedAt = performance.now();
   const res = await fetch("https://api.typecast.ai/v1/text-to-speech/stream", {
     method: "POST",
@@ -136,111 +90,102 @@ async function typecastSynth(voiceId: string, text: string, scenario: ScenarioId
       text,
       model: TYPECAST_MODEL,
       language: "kor",
-      prompt: { emotion_type: p.emotion },
+      // emotion_type은 판별자다. 프리셋 이름은 emotion_preset에 들어간다.
+      prompt: { emotion_type: "preset", emotion_preset: p.emotion, emotion_intensity: p.intensity },
       // 스트리밍에서는 volume을 못 쓴다. 레벨은 target_lufs로만 맞춘다.
       output: { audio_format: "wav", audio_pitch: p.pitch, audio_tempo: p.tempo, target_lufs: -16 },
     }),
   });
-  if (!res.ok) throw new Error(`typecast ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const { body, ttfbMs } = await drain(res, startedAt);
-  // 첫 청크에 44바이트 WAV 헤더가 붙어 온다. 32kHz/16bit/mono.
-  const pcm = body.subarray(0, 4).toString("ascii") === "RIFF" ? body.subarray(44) : body;
-  return { audio: pcm, sampleRate: 32000, ttfbMs };
-}
+  if (!res.ok) {
+    const detail = (await res.text()).slice(0, 300);
+    // 422 VALIDATION_ERROR는 우리 요청이 틀린 것이지 대사가 막힌 게 아니다.
+    // 이 둘을 섞으면 스키마 실수를 모더레이션 차단으로 오판하게 된다.
+    const err = new Error(`typecast ${res.status}: ${detail}`) as Error & { kind?: string };
+    err.kind = res.status === 422 || /VALIDATION_ERROR/.test(detail) ? "request" : "refused";
+    throw err;
+  }
+  if (!res.body) throw new Error("응답 본문이 없습니다.");
 
-type ProviderId = "eleven" | "typecast";
-
-const PROVIDERS: Record<ProviderId, { synth: typeof elevenSynth; key: string | undefined }> = {
-  eleven: { synth: elevenSynth, key: ELEVEN_KEY },
-  typecast: { synth: typecastSynth, key: TYPECAST_KEY },
-};
-
-function activeProviders(only?: string): ProviderId[] {
-  const ids = (Object.keys(PROVIDERS) as ProviderId[]).filter((id) => PROVIDERS[id].key);
-  return only ? ids.filter((id) => id === only) : ids;
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let received = 0;
+  let ttfbMs = -1;
+  let ttfaMs = -1;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value?.length) continue;
+    const now = performance.now() - startedAt;
+    if (ttfbMs < 0) ttfbMs = now;
+    received += value.length;
+    // 헤더 44바이트를 넘긴 첫 순간이 소리가 실제로 나기 시작하는 시점이다.
+    if (ttfaMs < 0 && received > 44) ttfaMs = now;
+    chunks.push(Buffer.from(value));
+  }
+  const body = Buffer.concat(chunks);
+  const audio = body.subarray(0, 4).toString("ascii") === "RIFF" ? body.subarray(44) : body;
+  const fallback = performance.now() - startedAt;
+  return { audio, ttfbMs: ttfbMs < 0 ? fallback : ttfbMs, ttfaMs: ttfaMs < 0 ? fallback : ttfaMs };
 }
 
 // --- voice 목록 -------------------------------------------------------------
 
-type VoiceCandidate = {
-  provider: ProviderId;
-  voiceId: string;
-  name: string;
-  detail: string;
-  /** ElevenLabs 라이브러리 voice의 소유자. 워크스페이스에 추가할 때 필요하다. */
-  ownerId?: string;
+type Voice = { voiceId: string; name: string; gender: string; age: string; useCases: string[] };
+
+// 카탈로그에 언어 필드가 없다. Typecast는 한국어가 기본이고 596개가 전부 한국어 voice다.
+// 그래서 언어가 아니라 배역으로 좁혀야 한다.
+const ROLE_FILTER: Record<ScenarioId, { gender: string; ages: string[]; useCases: string[] }> = {
+  // 낮고 건조한 40대 남성 수사관 — 뉴스·다큐 계열이 사무적인 톤에 가깝다.
+  institution: {
+    gender: "male",
+    ages: ["middle_age"],
+    useCases: ["News Reporter", "Announcer", "Documentary", "Conversational"],
+  },
+  // 숨차고 다급한 20대 후반 남성 — 감정 폭이 큰 연기 계열.
+  family: {
+    gender: "male",
+    ages: ["young_adult"],
+    useCases: ["Conversational", "Audiobook/Storytelling", "Anime"],
+  },
+  // 매끄럽고 빠른 30대 여성 상담원 — 안내·광고 계열.
+  loan: {
+    gender: "female",
+    ages: ["young_adult", "middle_age"],
+    useCases: ["Voicemail/Voice Assistant", "Ads/Promotion", "Announcer", "Conversational"],
+  },
 };
 
-// ElevenLabs 기본 제공 voice는 전부 영어 원어민이라 한국어를 읽히면 억양이 남는다.
-// 한국어 네이티브는 라이브러리의 Professional 클론에만 있고, 그쪽에 언어 태그가 붙는다.
-// (무료 티어는 라이브러리 API를 못 쓴다 — Starter 이상 필요)
-async function elevenKoreanVoices(): Promise<VoiceCandidate[]> {
-  const url =
-    "https://api.elevenlabs.io/v1/shared-voices" +
-    "?language=ko&category=professional&page_size=40&sort=cloned_by_count";
-  const res = await fetch(url, { headers: { "xi-api-key": ELEVEN_KEY! } });
-  if (!res.ok) throw new Error(`eleven voices ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const body = (await res.json()) as { voices?: Array<Record<string, string>> };
-  return (body.voices ?? []).map((v) => ({
-    provider: "eleven" as const,
-    voiceId: v.voice_id,
-    name: v.name,
-    ownerId: v.public_owner_id,
-    detail: [v.gender, v.age, v.accent, v.descriptive, v.use_case].filter(Boolean).join(" / "),
-  }));
-}
-
-// 라이브러리 voice는 워크스페이스에 추가해야 TTS에서 쓸 수 있다. 추가는 소유자가 나중에
-// 공유를 내려도 우리 쪽 voice_id가 살아남게 하는 고정 장치이기도 하다 — 심사 기간에
-// 404가 나면 그대로 결격이므로 스파이크 단계에서 미리 붙여 둔다.
-const addedVoices = new Map<string, string>();
-
-async function ensureElevenVoice(v: VoiceCandidate): Promise<string> {
-  if (!v.ownerId) return v.voiceId; // 이미 내 워크스페이스 voice
-  const cached = addedVoices.get(v.voiceId);
-  if (cached) return cached;
-
-  const res = await fetch(`https://api.elevenlabs.io/v1/voices/add/${v.ownerId}/${v.voiceId}`, {
-    method: "POST",
-    headers: { "xi-api-key": ELEVEN_KEY!, "Content-Type": "application/json" },
-    body: JSON.stringify({ new_name: `spike-${v.name}`.slice(0, 100) }),
-  });
-  if (!res.ok) {
-    // 이미 추가돼 있으면 원래 id가 그대로 동작한다. 그 외 실패는 호출자가 보게 둔다.
-    const detail = (await res.text()).slice(0, 200);
-    if (!/already/i.test(detail)) throw new Error(`eleven add ${res.status}: ${detail}`);
-    addedVoices.set(v.voiceId, v.voiceId);
-    return v.voiceId;
-  }
-  const body = (await res.json()) as { voice_id?: string };
-  const id = body.voice_id ?? v.voiceId;
-  addedVoices.set(v.voiceId, id);
-  return id;
-}
-
-/** 프로바이더에 맞는, 실제로 합성에 쓸 수 있는 voice id. */
-async function usableVoiceId(v: VoiceCandidate): Promise<string> {
-  return v.provider === "eleven" ? ensureElevenVoice(v) : v.voiceId;
-}
-
-async function typecastKoreanVoices(): Promise<VoiceCandidate[]> {
+async function allVoices(): Promise<Voice[]> {
+  if (!TYPECAST_KEY) throw new Error("TYPECAST_API_KEY가 없습니다.");
   const res = await fetch("https://api.typecast.ai/v2/voices", {
-    headers: { "X-API-KEY": TYPECAST_KEY! },
+    headers: { "X-API-KEY": TYPECAST_KEY },
   });
   if (!res.ok) throw new Error(`typecast voices ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const body = (await res.json()) as Array<Record<string, unknown>>;
-  const list = Array.isArray(body) ? body : ((body as Record<string, unknown>).voices as typeof body) ?? [];
+  const body = (await res.json()) as unknown;
+  const list = (Array.isArray(body) ? body : ((body as { voices?: unknown[] }).voices ?? [])) as Array<
+    Record<string, unknown>
+  >;
   return list
-    .filter((v) => {
-      const models = v.models ?? v.model;
-      return !Array.isArray(models) || models.includes(TYPECAST_MODEL);
-    })
+    // models는 문자열이 아니라 {version, emotions} 객체 배열이다.
+    .filter((v) => (v.models as Array<{ version?: string }> | undefined)?.some((m) => m.version === TYPECAST_MODEL))
     .map((v) => ({
-      provider: "typecast" as const,
-      voiceId: String(v.voice_id ?? v.id),
-      name: String(v.voice_name ?? v.name ?? ""),
-      detail: [v.gender, v.age, v.use_case].filter(Boolean).join(" / "),
+      voiceId: String(v.voice_id),
+      name: String(v.voice_name ?? ""),
+      gender: String(v.gender ?? ""),
+      age: String(v.age ?? ""),
+      useCases: (v.use_cases as string[] | undefined) ?? [],
     }));
+}
+
+/** 배역에 맞는 후보. use_case가 앞쪽에 적힌 것일수록 그 배역에 가깝다고 보고 정렬한다. */
+function candidatesFor(voices: Voice[], scenario: ScenarioId, limit: number): Voice[] {
+  const f = ROLE_FILTER[scenario];
+  return voices
+    .filter((v) => v.gender === f.gender && f.ages.includes(v.age) && v.useCases.some((u) => f.useCases.includes(u)))
+    .map((v) => ({ v, rank: Math.min(...v.useCases.map((u) => f.useCases.indexOf(u)).filter((i) => i >= 0)) }))
+    .sort((a, b) => a.rank - b.rank)
+    .slice(0, limit)
+    .map(({ v }) => v);
 }
 
 // --- WAV --------------------------------------------------------------------
@@ -277,94 +222,104 @@ const ms = (n: number) => `${Math.round(n)}ms`;
 
 // --- 모드: moderation --------------------------------------------------------
 
-// 가장 먼저 돌려야 하는 게이트. 사기범 대사를 프로바이더가 거부하면 나머지 측정은 의미가 없다.
-async function runModeration(only?: string) {
-  const providers = activeProviders(only);
-  if (!providers.length) return console.error("키가 설정된 프로바이더가 없습니다.");
-
+// 가장 먼저 돌려야 하는 게이트. Typecast가 사기범 대사를 거부하면 나머지 측정은 의미가 없고,
+// 대안 프로바이더도 없으므로 그대로 전면 중단이다.
+async function runModeration() {
   console.log("=== moderation ===");
-  console.log("사기범 대사를 각 프로바이더가 합성해 주는지 확인한다.\n");
+  console.log("사기범 대사를 Typecast가 합성해 주는지 확인한다.\n");
 
-  const rows: string[] = [];
-  for (const provider of providers) {
-    // voice는 아무거나 하나면 된다. 거부는 텍스트를 보고 일어난다.
-    const voices = provider === "eleven" ? await elevenKoreanVoices() : await typecastKoreanVoices();
-    const voice = voices[0];
-    if (!voice) {
-      rows.push(`${provider}: 한국어 voice를 못 찾아 확인 불가`);
-      continue;
-    }
-    for (const line of spikeLines()) {
-      try {
-        const out = await PROVIDERS[provider].synth(await usableVoiceId(voice), line.text, line.scenario);
-        const ok = out.audio.length > 0;
-        rows.push(`${provider} ${line.scenario}/${line.kind}: ${ok ? "합성됨" : "빈 응답"} (${out.audio.length}B)`);
-      } catch (err) {
-        rows.push(`${provider} ${line.scenario}/${line.kind}: 거부/실패 — ${(err as Error).message}`);
-      }
+  // voice는 아무거나 하나면 된다. 거부는 텍스트를 보고 일어난다.
+  const [voice] = await allVoices();
+  if (!voice) return console.error("voice를 찾지 못했습니다.");
+
+  let refused = 0;
+  let broken = 0;
+  for (const line of spikeLines()) {
+    try {
+      const out = await synth(voice.voiceId, line.text, line.scenario);
+      console.log(`  ${line.scenario}/${line.kind}: 합성됨 (${out.audio.length}B)`);
+    } catch (err) {
+      const e = err as Error & { kind?: string };
+      if (e.kind === "request") broken++;
+      else refused++;
+      console.log(`  ${line.scenario}/${line.kind}: ${e.kind === "request" ? "요청 오류" : "거부"} — ${e.message}`);
     }
   }
-  rows.forEach((r) => console.log(" ", r));
-  console.log("\n판정: 한 프로바이더의 대사가 전부 '합성됨'이어야 그 프로바이더가 후보로 남는다.");
+  if (broken) {
+    console.log(`\n판정 불가. ${broken}개가 요청 스키마 오류로 실패했다. 스크립트를 고치고 다시 돌린다.`);
+  } else if (refused) {
+    console.log(`\n중단. ${refused}개 대사가 막혔다. 대안 프로바이더가 없으므로 이 경로를 접는다.`);
+  } else {
+    console.log("\n통과. 6개 대사 전부 합성됐다.");
+  }
 }
 
 // --- 모드: voices ------------------------------------------------------------
 
-async function runVoices(only?: string) {
-  for (const provider of activeProviders(only)) {
-    const voices = provider === "eleven" ? await elevenKoreanVoices() : await typecastKoreanVoices();
-    console.log(`\n=== ${provider} 한국어 voice (${voices.length}) ===`);
-    voices.forEach((v) => console.log(`  ${v.voiceId}  ${v.name.padEnd(24)} ${v.detail}`));
-    if (provider === "eleven" && !voices.length)
-      console.log("  (비어 있음 — 무료 티어는 라이브러리 API를 쓸 수 없다. Starter 이상 필요)");
+async function runVoices(limit: number) {
+  const voices = await allVoices();
+  console.log(`=== Typecast voice: 전체 ${voices.length}개 중 배역별 상위 ${limit}개 ===\n`);
+
+  for (const s of SCENARIOS) {
+    const picks = candidatesFor(voices, s.id, limit);
+    console.log(`${s.id} — ${s.ttsInstructions.split(".")[0]}.`);
+    if (!picks.length) console.log("  (조건에 맞는 voice 없음 — ROLE_FILTER를 넓혀야 한다)");
+    picks.forEach((v) =>
+      console.log(`  ${v.voiceId}  ${v.name.padEnd(18)} ${v.gender}/${v.age}  ${v.useCases.join(", ")}`),
+    );
+    console.log("");
   }
-  console.log("\n배역별 3~5개를 골라 --voices 인자로 samples에 넘긴다.");
-  console.log("  institution: 낮고 건조한 40대 남성 / family: 20대 후반 남성 / loan: 30대 여성 상담원");
+  console.log("samples는 인자 없이 돌리면 위 후보를 그대로 쓴다.");
+  console.log("특정 voice만 듣고 싶으면 --voices id1,id2 (배역 3종 대사를 모두 읽힌다).");
 }
 
 // --- 모드: samples -----------------------------------------------------------
 
 type Manifest = {
   createdAt: string;
-  blind: Record<string, { provider: string; voiceId: string; voiceName: string; scenario: string; kind: string }>;
+  blind: Record<string, { voiceId: string; voiceName: string; scenario: string; kind: string }>;
 };
 
 // 파일명이 정답을 흘리면 블라인드가 아니다. 해시로 바꾸고 매핑은 manifest에만 남긴다.
-async function runSamples(only: string | undefined, voiceArg: string | undefined) {
-  const providers = activeProviders(only);
-  if (!providers.length) return console.error("키가 설정된 프로바이더가 없습니다.");
+async function runSamples(voiceArg: string | undefined, limit: number) {
+  const all = await allVoices();
+  const wanted = voiceArg?.split(",").map((x) => x.trim()).filter(Boolean);
+
+  // 기본은 배역별 후보에게 그 배역 대사만 읽힌다 — 여성 목소리에게 아들 대사를 읽힐 이유가 없다.
+  // --voices로 지정하면 그 voice들이 배역 3종을 전부 읽는다. 한 목소리의 폭을 보려는 용도다.
+  const work = wanted
+    ? all.filter((v) => wanted.includes(v.voiceId)).flatMap((v) => spikeLines().map((line) => ({ voice: v, line })))
+    : SCENARIOS.flatMap((s) =>
+        candidatesFor(all, s.id, limit).flatMap((v) =>
+          spikeLines()
+            .filter((l) => l.scenario === s.id)
+            .map((line) => ({ voice: v, line })),
+        ),
+      );
+
+  if (!work.length) return console.error("대상 voice가 없습니다.");
 
   mkdirSync(SAMPLE_DIR, { recursive: true });
   const manifest: Manifest = { createdAt: new Date().toISOString(), blind: {} };
-  const picked = voiceArg?.split(",").map((s) => s.trim()).filter(Boolean);
 
-  for (const provider of providers) {
-    const all = provider === "eleven" ? await elevenKoreanVoices() : await typecastKoreanVoices();
-    const voices = picked ? all.filter((v) => picked.includes(v.voiceId)) : all.slice(0, 4);
-    if (!voices.length) {
-      console.error(`${provider}: 대상 voice가 없습니다.`);
-      continue;
-    }
-    for (const voice of voices) {
-      for (const line of spikeLines()) {
-        try {
-          const out = await PROVIDERS[provider].synth(await usableVoiceId(voice), line.text, line.scenario);
-          const blindId = createHash("sha256")
-            .update(`${randomUUID()}|${provider}|${voice.voiceId}|${line.scenario}|${line.kind}`)
-            .digest("hex")
-            .slice(0, 12);
-          writeFileSync(join(SAMPLE_DIR, `${blindId}.wav`), toWav(out.audio, out.sampleRate));
-          manifest.blind[blindId] = {
-            provider,
-            voiceId: voice.voiceId,
-            voiceName: voice.name,
-            scenario: line.scenario,
-            kind: line.kind,
-          };
-          console.log(`  ${blindId}  ${provider} ${voice.name} ${line.scenario}/${line.kind} (${ms(out.ttfbMs)})`);
-        } catch (err) {
-          console.error(`  실패 ${provider} ${voice.name} ${line.scenario}/${line.kind}: ${(err as Error).message}`);
-        }
+  {
+    for (const { voice, line } of work) {
+      try {
+        const out = await synth(voice.voiceId, line.text, line.scenario);
+        const blindId = createHash("sha256")
+          .update(`${randomUUID()}|${voice.voiceId}|${line.scenario}|${line.kind}`)
+          .digest("hex")
+          .slice(0, 12);
+        writeFileSync(join(SAMPLE_DIR, `${blindId}.wav`), toWav(out.audio, TYPECAST_RATE));
+        manifest.blind[blindId] = {
+          voiceId: voice.voiceId,
+          voiceName: voice.name,
+          scenario: line.scenario,
+          kind: line.kind,
+        };
+        console.log(`  ${blindId}  ${voice.name.padEnd(18)} ${line.scenario}/${line.kind} (${ms(out.ttfbMs)})`);
+      } catch (err) {
+        console.error(`  실패 ${voice.name} ${line.scenario}/${line.kind}: ${(err as Error).message}`);
       }
     }
   }
@@ -382,40 +337,42 @@ async function runSamples(only: string | undefined, voiceArg: string | undefined
 
 // --- 모드: latency -----------------------------------------------------------
 
-async function runLatency(only: string | undefined, reps: number, voiceArg: string | undefined) {
-  const providers = activeProviders(only);
-  if (!providers.length) return console.error("키가 설정된 프로바이더가 없습니다.");
+async function runLatency(reps: number, voiceArg: string | undefined) {
+  const all = await allVoices();
+  const wanted = voiceArg?.split(",").map((x) => x.trim());
+  const voice = all.find((v) => wanted?.includes(v.voiceId)) ?? candidatesFor(all, "institution", 1)[0] ?? all[0];
+  if (!voice) return console.error("대상 voice가 없습니다.");
 
-  console.log(`=== latency (${reps}회/조합) ===`);
+  console.log(`=== latency (${reps}회, ${voice.name}) ===`);
   console.log("데모에 쓸 노트북·네트워크에서 재야 의미가 있다.\n");
 
-  for (const provider of providers) {
-    const all = provider === "eleven" ? await elevenKoreanVoices() : await typecastKoreanVoices();
-    const picked = voiceArg?.split(",").map((s) => s.trim());
-    const voice = all.find((v) => picked?.includes(v.voiceId)) ?? all[0];
-    if (!voice) continue;
-
-    // 오프닝 세 개만 쓴다. 첫 문장의 지연이 통화 체감을 좌우한다.
-    const lines = spikeLines().filter((l) => l.kind === "opening");
-    const samples: number[] = [];
-    const voiceId = await usableVoiceId(voice);
-    for (let i = 0; i < reps; i++) {
-      const line = lines[i % lines.length];
-      try {
-        const out = await PROVIDERS[provider].synth(voiceId, line.text, line.scenario);
-        samples.push(out.ttfbMs);
-      } catch (err) {
-        console.error(`  실패: ${(err as Error).message}`);
-      }
+  // 오프닝 세 개만 쓴다. 첫 문장의 지연이 통화 체감을 좌우한다.
+  const lines = spikeLines().filter((l) => l.kind === "opening");
+  const ttfb: number[] = [];
+  const ttfa: number[] = [];
+  for (let i = 0; i < reps; i++) {
+    const line = lines[i % lines.length];
+    try {
+      const out = await synth(voice.voiceId, line.text, line.scenario);
+      ttfb.push(out.ttfbMs);
+      ttfa.push(out.ttfaMs);
+    } catch (err) {
+      console.error(`  실패: ${(err as Error).message}`);
     }
-    if (!samples.length) continue;
-    console.log(
-      `  ${provider.padEnd(9)} n=${samples.length}  p50 ${ms(percentile(samples, 50))}  ` +
-        `p95 ${ms(percentile(samples, 95))}  min ${ms(Math.min(...samples))}  max ${ms(Math.max(...samples))}`,
-    );
   }
-  console.log("\n중단 기준: 두 프로바이더 모두 TTFB p95 > 400ms면 이 경로를 접는다.");
-  console.log("주의: Typecast는 브라우저에서 직결이 안 되고 프록시 홉이 하나 더 붙는다.");
+  if (!ttfa.length) return;
+
+  const row = (label: string, xs: number[]) =>
+    console.log(
+      `  ${label.padEnd(16)} n=${xs.length}  p50 ${ms(percentile(xs, 50))}  p95 ${ms(percentile(xs, 95))}  ` +
+        `min ${ms(Math.min(...xs))}  max ${ms(Math.max(...xs))}`,
+    );
+  row("첫 바이트", ttfb);
+  row("첫 오디오", ttfa);
+  console.log("\n첫 바이트는 WAV 헤더라 합성 전에 나간다. 판정은 '첫 오디오'로 한다.");
+  console.log("중단 기준: 첫 오디오 p95 > 400ms면 이 경로를 접는다.");
+  console.log("주의: 이 값은 서버에서 직결로 잰 것이다. 브라우저는 키를 못 들고 있어");
+  console.log("      Next 라우트를 경유하므로 실제로는 프록시 홉이 하나 더 붙는다.");
 }
 
 // --- 모드: baseline ----------------------------------------------------------
@@ -423,22 +380,31 @@ async function runLatency(only: string | undefined, reps: number, voiceArg: stri
 // 현행 Realtime의 "발화 종료 → 첫 소리" 지연. 한 번도 실측된 적이 없어서, 이 값 없이는
 // 교체 후 수치가 회귀인지 개선인지 말할 수 없다. eval 하네스와 같은 WebSocket 경로를 쓴다.
 // 브라우저 WebRTC는 여기에 지터가 더 붙으므로 이 값은 하한이다.
-async function runBaseline(reps: number) {
+async function runBaseline(reps: number, textOut: boolean) {
   if (!process.env.OPENAI_API_KEY) return console.error("OPENAI_API_KEY가 없습니다.");
 
-  console.log(`=== baseline: 현행 Realtime 응답 지연 (${reps}회) ===`);
+  console.log(`=== baseline: ${textOut ? "텍스트 출력" : "현행 오디오 출력"} 응답 지연 (${reps}회) ===`);
   console.log("WebSocket 경로 기준이라 브라우저 WebRTC의 지터가 빠진 하한값이다.\n");
 
   const scenario = SCENARIOS[0];
   const opening: number[] = [];
   const turn: number[] = [];
+  const sentence: number[] = [];
+  const firstSentences: string[] = [];
 
   for (let i = 0; i < reps; i++) {
     try {
-      const r = await oneBaselineCall(scenario);
+      const r = await oneBaselineCall(scenario, textOut);
       opening.push(r.openingMs);
       turn.push(r.turnMs);
-      console.log(`  ${i + 1}/${reps}: 오프닝 ${ms(r.openingMs)}  대화 중 턴 ${ms(r.turnMs)}`);
+      if (r.sentenceMs) {
+        sentence.push(r.sentenceMs);
+        firstSentences.push(r.firstSentence);
+      }
+      console.log(
+        `  ${i + 1}/${reps}: 오프닝 ${ms(r.openingMs)}  대화 중 턴 ${ms(r.turnMs)}` +
+          (r.sentenceMs ? `  첫 문장 완성 ${ms(r.sentenceMs)}` : ""),
+      );
     } catch (err) {
       console.error(`  실패: ${(err as Error).message}`);
     }
@@ -453,9 +419,21 @@ async function runBaseline(reps: number) {
 
   console.log("");
   report("오프닝", opening);
-  report("대화 중 턴", turn);
-  console.log("\n오프닝은 전체 지시문이 통째로 실리는 최악 조건이다. 교체 후 비교 기준은 '대화 중 턴'.");
-  console.log("합격선: 대화 중 턴 p50이 위 값 대비 +350ms 이내.");
+  report("대화 중 턴(첫 델타)", turn);
+  if (sentence.length) report("첫 문장 완성", sentence);
+  console.log("\n오프닝은 전체 지시문이 통째로 실리는 최악 조건이다. 비교 기준은 '대화 중 턴'.");
+  if (textOut) {
+    // Typecast는 완성된 문장을 요청 단위로 받는다. 첫 델타가 아니라 첫 문장이 끝나야 합성이 시작된다.
+    console.log("Typecast는 완성된 문장을 받아야 하므로 실제 트리거는 '첫 문장 완성'이다.");
+    console.log("교체 후 체감 지연 = 첫 문장 완성 + TTS 첫 오디오.");
+    if (firstSentences.length) {
+      const lens = firstSentences.map((t) => t.length);
+      console.log(`첫 문장 길이: 중앙값 ${percentile(lens, 50)}자 (min ${Math.min(...lens)} / max ${Math.max(...lens)})`);
+      console.log(`예: "${firstSentences[0]}"`);
+    }
+  } else {
+    console.log("합격선: 교체 후 대화 중 턴 p50이 이 값 대비 +350ms 이내.");
+  }
 }
 
 /** 훈련자 대사 PCM. eval 하네스와 같은 캐시 키를 쓴다 (24kHz mono). */
@@ -481,7 +459,10 @@ async function victimPcm(text: string): Promise<Buffer> {
  *   openingMs — response.create → 첫 오디오 델타 (전체 지시문이 실리는 최악 조건)
  *   turnMs    — speech_stopped → 첫 오디오 델타 (실제 대화 중 체감 지연)
  */
-async function oneBaselineCall(scenario: (typeof SCENARIOS)[number]): Promise<{ openingMs: number; turnMs: number }> {
+async function oneBaselineCall(
+  scenario: (typeof SCENARIOS)[number],
+  textOut: boolean,
+): Promise<{ openingMs: number; turnMs: number; sentenceMs: number; firstSentence: string }> {
   const pcm = await victimPcm(SCRIPTS[scenario.id].skeptical[0].text);
 
   return new Promise((resolve, reject) => {
@@ -498,8 +479,12 @@ async function oneBaselineCall(scenario: (typeof SCENARIOS)[number]): Promise<{ 
     let askedAt = 0;
     let stoppedAt = 0;
     let openingMs = 0;
+    let turnMs = 0;
+    let buffered = "";
 
-    const finish = (value: { openingMs: number; turnMs: number } | Error) => {
+    const finish = (
+      value: { openingMs: number; turnMs: number; sentenceMs: number; firstSentence: string } | Error,
+    ) => {
       clearTimeout(timer);
       ws.close();
       if (value instanceof Error) reject(value);
@@ -526,6 +511,13 @@ async function oneBaselineCall(scenario: (typeof SCENARIOS)[number]): Promise<{ 
       // WebSocket은 모델을 URL 쿼리로 고정하므로 session에서 model을 뺀다.
       const session: Record<string, unknown> = { ...buildSessionConfig(scenario) };
       delete session.model;
+      if (textOut) {
+        // 오디오 입력(VAD·전사)은 그대로 두고 출력만 텍스트로 돌린다.
+        // 이 조합이 실제로 성립하는지도 여기서 함께 확인된다.
+        session.output_modalities = ["text"];
+        const audio = session.audio as Record<string, unknown>;
+        session.audio = { input: audio.input };
+      }
       ws.send(JSON.stringify({ type: "session.update", session }));
     };
     ws.onerror = () => finish(new Error("WebSocket 오류"));
@@ -541,12 +533,24 @@ async function oneBaselineCall(scenario: (typeof SCENARIOS)[number]): Promise<{ 
             }),
           );
           break;
-        case "response.output_audio.delta":
+        case textOut ? "response.output_text.delta" : "response.output_audio.delta":
           if (phase === "opening") {
             openingMs = performance.now() - askedAt;
             phase = "speaking";
           } else if (phase === "turn" && stoppedAt) {
-            finish({ openingMs, turnMs: performance.now() - stoppedAt });
+            if (!turnMs) turnMs = performance.now() - stoppedAt;
+            if (!textOut) return finish({ openingMs, turnMs, sentenceMs: 0, firstSentence: "" });
+            // 문장 경계까지 모은다. 한국어 종결부호 + 줄바꿈.
+            buffered += (ev as { delta?: string }).delta ?? "";
+            const m = /[.!?…\n]/.exec(buffered);
+            if (m) {
+              finish({
+                openingMs,
+                turnMs,
+                sentenceMs: performance.now() - stoppedAt,
+                firstSentence: buffered.slice(0, m.index + 1).trim(),
+              });
+            }
           }
           break;
         case "response.done":
@@ -576,7 +580,6 @@ function arg(name: string): string | undefined {
 
 async function main() {
   const mode = process.argv[2];
-  const only = arg("provider");
   const reps = Number(arg("reps") ?? 20);
   const voices = arg("voices");
 
@@ -584,21 +587,22 @@ async function main() {
 
   switch (mode) {
     case "moderation":
-      return runModeration(only);
+      return runModeration();
     case "voices":
-      return runVoices(only);
+      return runVoices(Number(arg("limit") ?? 6));
     case "samples":
-      return runSamples(only, voices);
+      return runSamples(voices, Number(arg("limit") ?? 4));
     case "latency":
-      return runLatency(only, reps, voices);
+      return runLatency(reps, voices);
     case "baseline":
-      return runBaseline(Number(arg("reps") ?? 10));
+      return runBaseline(Number(arg("reps") ?? 10), process.argv.includes("--text"));
     default:
       console.log("사용법: node --env-file=.env scripts/tts-spike.ts <mode>");
       console.log("  moderation | voices | samples | latency | baseline");
-      console.log("  옵션: --provider eleven|typecast  --reps N  --voices id1,id2");
+      console.log("  옵션: --reps N  --voices id1,id2  --limit N(배역별 후보 수)");
+      console.log("  baseline --text 는 output_modalities:[\"text\"] 경로를 잰다.");
       console.log("\n권장 순서: moderation → voices → samples(청취) → latency");
-      console.log("baseline은 키 없이 지금 바로 돌릴 수 있다.");
+      console.log("baseline은 TYPECAST_API_KEY 없이도 돌아간다.");
       process.exitCode = 1;
   }
 }
